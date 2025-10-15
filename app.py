@@ -206,8 +206,8 @@ def process_chunk_batch(client: OpenAI, model: str, theme_dict: Dict[str, Any], 
         
         return retry_with_backoff(make_request)
     
-    # Process chunks in parallel (limit to 3 concurrent requests to respect rate limits)
-    max_workers = min(3, len(chunks))
+    # Process chunks in parallel (reduced to 1 for cost optimization)
+    max_workers = 1  # Sequential processing to minimize costs
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all chunks for processing
@@ -256,8 +256,8 @@ def process_chunk_batch_optimized(client: OpenAI, model: str, theme_dict: Dict[s
         
         return retry_with_backoff(make_request)
     
-    # Use conservative parallelism for GPT-5 (up to 3 concurrent requests for quality)
-    max_workers = min(3, len(chunks))
+    # Use minimal parallelism for cost optimization (sequential processing)
+    max_workers = 1  # Sequential processing to minimize costs
     
     # Progress tracking - use provided progress elements or create new ones
     if progress_bar is None:
@@ -601,8 +601,8 @@ def build_theme_frame(client: OpenAI, model: str, texts: List[str], freq: List[i
             
             return retry_with_backoff(make_chunk_request)
         
-        # Use parallel processing for theme generation
-        max_workers = min(5, len(chunks))  # Parallel theme generation
+        # Use minimal parallelism for cost optimization
+        max_workers = 1  # Sequential processing to minimize costs
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_chunk = {executor.submit(process_theme_chunk, chunk): i for i, chunk in enumerate(chunks)}
@@ -1098,8 +1098,8 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
             
             return retry_with_backoff(make_chunk_request)
         
-        # Use parallel processing for theme generation
-        max_workers = min(5, len(chunks))  # Parallel theme generation
+        # Use minimal parallelism for cost optimization
+        max_workers = 1  # Sequential processing to minimize costs
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_chunk = {executor.submit(process_theme_chunk, chunk): i for i, chunk in enumerate(chunks)}
@@ -1501,8 +1501,8 @@ def assign_codes_with_progress(client: OpenAI, model: str, theme_dict: Dict[str,
         
         return chunk_assignments, chunk_usage
     
-    # Use optimized parallel processing
-    max_workers = min(50, len(all_chunks))
+    # Use minimal parallelism for cost optimization
+    max_workers = min(3, len(all_chunks))  # Reduced from 50 to 3 for cost savings
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all chunks for processing
@@ -1766,8 +1766,8 @@ def verify_low_confidence(client: OpenAI, model: str, theme_dict: Dict[str, Any]
         
         return retry_with_backoff(make_request)
     
-    # Use parallel processing for verification
-    max_workers = min(20, len(all_chunks))
+    # Use minimal parallelism for cost optimization
+    max_workers = min(2, len(all_chunks))  # Reduced from 20 to 2 for cost savings
     
     all_verified = []
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
