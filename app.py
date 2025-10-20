@@ -1,5 +1,5 @@
 """
-Express Explorer Thematic Coder — Streamlit MVP
+Future Partners Open-Ended Coding Tool — Streamlit MVP
 Single‑file Streamlit app to upload survey open‑ends, auto‑discover Major/Sub themes,
 assign single or multi‑codes with confidence, verify low‑confidence rows, and export XLSX.
 
@@ -206,8 +206,8 @@ def process_chunk_batch(client: OpenAI, model: str, theme_dict: Dict[str, Any], 
         
         return retry_with_backoff(make_request)
     
-    # Process chunks in parallel (reduced to 1 for cost optimization)
-    max_workers = 1  # Sequential processing to minimize costs
+    # Process chunks with configurable parallelism
+    max_workers = max(1, min(parallel_requests, len(chunks)))
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all chunks for processing
@@ -256,8 +256,8 @@ def process_chunk_batch_optimized(client: OpenAI, model: str, theme_dict: Dict[s
         
         return retry_with_backoff(make_request)
     
-    # Use minimal parallelism for cost optimization (sequential processing)
-    max_workers = 1  # Sequential processing to minimize costs
+    # Use configurable parallelism (bounded by number of chunks)
+    max_workers = max(1, min(parallel_requests, len(chunks)))
     
     # Progress tracking - use provided progress elements or create new ones
     if progress_bar is None:
@@ -355,15 +355,18 @@ THEME_DISCOVERY_SYSTEM = (
     "You are a senior market research analyst. You design clear, business‑ready thematic taxonomies that provide actionable insights. Focus on the substantive content of what respondents are saying about the topic, not on survey mechanics or response quality. Use neutral, professional language. Specific themes are more valuable than generic 'Other' categories for business decision-making."
 )
 
-THEME_DISCOVERY_USER = (
-    """
-You will read a set of open‑ended responses for one survey question.
-Create a hierarchical coding frame with Major Themes and Sub‑themes.
+def get_theme_discovery_prompt(allow_multicode: bool) -> str:
+    """Generate theme discovery prompt based on multi-coding setting"""
+    
+    if allow_multicode:
+        coding_instruction = """
+IMPORTANT: Responses can be assigned to MULTIPLE themes when they genuinely address multiple concepts. Design your theme structure to accommodate this multi-coding approach.
+
 Goals:
 - Capture the full variety by creating specific, meaningful Sub‑themes. Prioritize creating distinct Sub‑themes over generic "Other" categories.
 - For each Major Theme and Sub-theme, include approx_pct ∈ [0,1] estimating coverage. Avoid Sub-themes below ~0.02 unless conceptually critical.
 - Ensure Major Themes are at similar abstraction levels; avoid one ultra-broad Major vs. highly narrow peers.
-- Keep Major Themes distinct and non‑overlapping.
+- Create themes that can work independently AND in combination - responses may legitimately belong to multiple themes.
 - Each Sub‑theme should ladder under exactly one Major Theme.
 - Create specific Sub‑themes even for smaller groups of similar responses (3+ responses with similar meaning warrant their own Sub‑theme).
 - If an 'Other [Major Topic]' Sub-theme is unavoidable, cap approx_pct ≤ 0.05 and define it clearly. Never create a Major Theme named 'Other'.
@@ -374,32 +377,58 @@ Goals:
 - Use neutral, professional language. Avoid judgmental terms like "weak", "poor", "bad", or "invalid". Instead use descriptive terms like "brief", "general", or "unspecified".
 - Assume responses are already translated to English.
 - Consider the frequency weights when balancing the frame. Popular ideas should not be buried.
+"""
+    else:
+        coding_instruction = """
+IMPORTANT: Each response will be assigned to EXACTLY ONE theme. Create distinct, mutually exclusive theme buckets that capture all response types without overlap.
+
+Goals:
+- Capture the full variety by creating specific, meaningful Sub‑themes. Prioritize creating distinct Sub‑themes over generic "Other" categories.
+- For each Major Theme and Sub-theme, include approx_pct ∈ [0,1] estimating coverage. Avoid Sub-themes below ~0.02 unless conceptually critical.
+- Ensure Major Themes are at similar abstraction levels; avoid one ultra-broad Major vs. highly narrow peers.
+- Keep Major Themes distinct and non‑overlapping - each response must fit into exactly one theme.
+- Each Sub‑theme should ladder under exactly one Major Theme.
+- Create specific Sub‑themes even for smaller groups of similar responses (3+ responses with similar meaning warrant their own Sub‑theme).
+- If an 'Other [Major Topic]' Sub-theme is unavoidable, cap approx_pct ≤ 0.05 and define it clearly. Never create a Major Theme named 'Other'.
+- Provide a short definition for each theme.
+- Example quotes ≤12 words; remove PII/URLs.
+- Respect these non‑answer rules: Do not mix non‑answers with substantive themes. Use a separate Major Theme named "Non‑answer" with Sub‑themes among: Refusal, Don't know, Nonsense, Spam, Not applicable. Include only those that appear. When a non-answer pattern is common, name the Sub-theme to reflect the question's context (e.g., 'Unable to Name a Positive Association' rather than generic 'Don't know').
+- Do NOT create themes about survey mechanics, selection processes, or respondent confusion unless responses explicitly mention problems with the survey itself. Focus on the substantive content of what respondents are saying.
+- Use neutral, professional language. Avoid judgmental terms like "weak", "poor", "bad", or "invalid". Instead use descriptive terms like "brief", "general", or "unspecified".
+- Assume responses are already translated to English.
+- Consider the frequency weights when balancing the frame. Popular ideas should not be buried.
+"""
+    
+    return f"""
+You will read a set of open‑ended responses for one survey question.
+Create a hierarchical coding frame with Major Themes and Sub‑themes.
+
+{coding_instruction}
 
 Return JSON only with this schema:
-{
+{{
   "major_themes": [
-    {
+    {{
       "id": "T1",
       "label": "<Major label>",
       "definition": "<one sentence>",
       "approx_pct": 0.00,
       "subs": [
-        {
+        {{
           "id": "T1.1",
           "label": "<Sub label>",
           "definition": "<one sentence>",
           "approx_pct": 0.00,
           "examples": ["ex1", "ex2", "ex3"]
-        }
+        }}
       ]
-    }
+    }}
   ]
-}
+}}
 Return only valid JSON matching the schema; do not include any additional text, code fences, or commentary. All id and label values must be unique across the taxonomy.
 
 IMPORTANT: Responses about preferences, desires, experiences, opinions, and reasons are SUBSTANTIVE CONTENT, not survey mechanics. Only classify responses as survey-related if they explicitly mention problems with the survey questions, confusion about instructions, or technical issues.
 """
-)
 
 ASSIGNMENT_SYSTEM = (
     "You are a meticulous qualitative coder. You assign responses to themes based on their substantive content, not on response quality or survey mechanics. Focus on what respondents are actually saying about the topic."
@@ -525,7 +554,7 @@ def oai_json_completion(client: OpenAI, model: str, system: str, user: str, seed
 # Theming logic
 # ------------------------------
 
-def build_theme_frame(client: OpenAI, model: str, texts: List[str], freq: List[int], seed: int | None, question_text: str = None) -> Tuple[Dict[str, Any], Dict[str, int]]:
+def build_theme_frame(client: OpenAI, model: str, texts: List[str], freq: List[int], seed: int | None, question_text: str = None, allow_multicode: bool = True) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """Create a hierarchical theme dictionary using a weighted sample of unique texts.
     We pass a compact JSON with objects: {"text": "...", "weight": n}
     Handles large datasets by chunking and processing in batches.
@@ -572,10 +601,11 @@ def build_theme_frame(client: OpenAI, model: str, texts: List[str], freq: List[i
     if total_tokens <= 400000:  # GPT-5 safe token limit
         payload = json.dumps(filtered_data)
         # Build prompt with optional question context
+        theme_prompt = get_theme_discovery_prompt(allow_multicode)
         if question_text and question_text.strip():
-            user = THEME_DISCOVERY_USER + f"\n\n**Survey Question:** {question_text}\n\nWeighted responses (JSON array):\n" + payload
+            user = theme_prompt + f"\n\n**Survey Question:** {question_text}\n\nWeighted responses (JSON array):\n" + payload
         else:
-            user = THEME_DISCOVERY_USER + "\n\nWeighted responses (JSON array):\n" + payload
+            user = theme_prompt + "\n\nWeighted responses (JSON array):\n" + payload
         
         def make_request():
             return oai_json_completion(client, model, THEME_DISCOVERY_SYSTEM, user, seed)
@@ -598,18 +628,19 @@ def build_theme_frame(client: OpenAI, model: str, texts: List[str], freq: List[i
         def process_theme_chunk(chunk):
             payload = json.dumps(chunk)
             # Build prompt with optional question context
+            theme_prompt = get_theme_discovery_prompt(allow_multicode)
             if question_text and question_text.strip():
-                user = THEME_DISCOVERY_USER + f"\n\n**Survey Question:** {question_text}\n\nWeighted responses (JSON array):\n" + payload
+                user = theme_prompt + f"\n\n**Survey Question:** {question_text}\n\nWeighted responses (JSON array):\n" + payload
             else:
-                user = THEME_DISCOVERY_USER + "\n\nWeighted responses (JSON array):\n" + payload
+                user = theme_prompt + "\n\nWeighted responses (JSON array):\n" + payload
             
             def make_chunk_request():
                 return oai_json_completion(client, model, THEME_DISCOVERY_SYSTEM, user, seed)
             
             return retry_with_backoff(make_chunk_request)
         
-        # Use minimal parallelism for cost optimization
-        max_workers = 1  # Sequential processing to minimize costs
+        # Use configurable parallelism (bounded by number of chunks)
+        max_workers = max(1, min(parallel_requests, len(chunks)))
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_chunk = {executor.submit(process_theme_chunk, chunk): i for i, chunk in enumerate(chunks)}
@@ -870,8 +901,199 @@ def suggest_new_themes_from_review(low_confidence_responses: List[Dict], existin
     
     return {"suggestions": [], "reasoning": "AI analysis not implemented yet"}
 
-# Theme quality validation removed - the AI prompt already includes quality guidelines
-# and there are no actionable items from validation scores
+# ------------------------------
+# Smart Quality Improvement
+# ------------------------------
+
+def diagnose_quality_issues(assigned_raw: List[Dict], theme_dict: Dict, coded_df: pd.DataFrame, iteration: int = 0) -> Dict[str, Any]:
+    """
+    Intelligently diagnose WHY confidence is low and recommend solutions.
+    Returns diagnosis with specific, actionable remediation strategies.
+    """
+    total_items = len(assigned_raw)
+    all_confidences = []
+    low_conf_items = []
+    theme_confusion = {}  # Track which themes are confused with each other
+    inherently_ambiguous = []  # Responses that are genuinely ambiguous
+    
+    for item in assigned_raw:
+        assigns = item.get("assignments", [])
+        if assigns:
+            top_conf = assigns[0].get("confidence", 0.0)
+            all_confidences.append(top_conf)
+            
+            if top_conf < 0.75:
+                low_conf_items.append(item)
+                
+                # Track confusion patterns (when confidence is spread across multiple themes)
+                if len(assigns) > 1:
+                    theme1 = assigns[0].get("theme_id")
+                    theme2 = assigns[1].get("theme_id")
+                    key = tuple(sorted([theme1, theme2]))
+                    theme_confusion[key] = theme_confusion.get(key, 0) + 1
+                    
+                    # Detect inherent ambiguity: multiple themes with similar low confidence
+                    conf1 = assigns[0].get("confidence", 0.0)
+                    conf2 = assigns[1].get("confidence", 0.0)
+                    if conf1 < 0.70 and abs(conf1 - conf2) < 0.15:  # Both low and close together
+                        inherently_ambiguous.append(item)
+    
+    avg_confidence = np.mean(all_confidences) if all_confidences else 0.0
+    low_conf_pct = (len(low_conf_items) / total_items * 100) if total_items > 0 else 0
+    
+    # Calculate theoretical maximum confidence
+    # Based on inherently ambiguous items that likely won't improve much
+    inherently_ambiguous_count = len(inherently_ambiguous)
+    improvable_items = len(low_conf_items) - inherently_ambiguous_count
+    
+    # Estimate potential improvement from verification
+    if improvable_items > 0:
+        # Verification typically improves confidence by 0.10-0.15 on average
+        expected_improvement_per_item = 0.12 - (iteration * 0.04)  # Diminishing returns
+        expected_improvement_per_item = max(0.02, expected_improvement_per_item)
+        
+        total_potential_improvement = (improvable_items / total_items) * expected_improvement_per_item
+    else:
+        total_potential_improvement = 0.0
+    
+    # Calculate theoretical maximum (current + potential)
+    theoretical_max = min(0.95, avg_confidence + total_potential_improvement + 0.05)
+    
+    # Adjust based on inherent ambiguity
+    if inherently_ambiguous_count > total_items * 0.15:  # >15% inherently ambiguous
+        theoretical_max = min(theoretical_max, 0.88)
+    
+    # Diagnose root causes
+    diagnosis = {
+        "avg_confidence": avg_confidence,
+        "low_conf_count": len(low_conf_items),
+        "low_conf_pct": low_conf_pct,
+        "improvable_count": improvable_items,
+        "inherently_ambiguous_count": inherently_ambiguous_count,
+        "theoretical_max": theoretical_max,
+        "estimated_improvement": total_potential_improvement,
+        "worth_improving": total_potential_improvement >= 0.03,  # Only worth it if >=3% improvement expected
+        "issues": [],
+        "recommended_action": None,
+        "confidence_distribution": {
+            "excellent": sum(1 for c in all_confidences if c >= 0.9) / len(all_confidences) * 100 if all_confidences else 0,
+            "good": sum(1 for c in all_confidences if 0.75 <= c < 0.9) / len(all_confidences) * 100 if all_confidences else 0,
+            "marginal": sum(1 for c in all_confidences if 0.6 <= c < 0.75) / len(all_confidences) * 100 if all_confidences else 0,
+            "poor": sum(1 for c in all_confidences if c < 0.6) / len(all_confidences) * 100 if all_confidences else 0,
+        }
+    }
+    
+    # Issue 1: Many items just need verification
+    if low_conf_pct > 15 and low_conf_pct < 40 and total_potential_improvement >= 0.03:
+        diagnosis["issues"].append(f"{improvable_items} items ({low_conf_pct:.1f}%) have borderline confidence and can be improved")
+        diagnosis["recommended_action"] = "verify_low_confidence"
+    
+    # Issue 2: Systematic confusion between themes
+    if theme_confusion and total_potential_improvement >= 0.03:
+        top_confusions = sorted(theme_confusion.items(), key=lambda x: x[1], reverse=True)[:3]
+        if top_confusions[0][1] > 10:  # More than 10 items confused between same pair
+            diagnosis["issues"].append(f"High confusion between similar themes (affects {top_confusions[0][1]} items)")
+            diagnosis["recommended_action"] = "verify_and_analyze"
+    
+    # Issue 3: Many items don't fit ANY theme well (all confidences low)
+    very_low_conf = sum(1 for c in all_confidences if c < 0.5)
+    if very_low_conf > total_items * 0.2 and total_potential_improvement >= 0.03:  # More than 20% have very low confidence
+        diagnosis["issues"].append(f"{very_low_conf} items ({very_low_conf/total_items*100:.1f}%) don't fit any theme well")
+        diagnosis["recommended_action"] = "suggest_new_themes"
+    
+    # Issue 4: Fundamental theme quality problem (most items are low confidence)
+    if low_conf_pct > 50:
+        diagnosis["issues"].append(f"Majority of items ({low_conf_pct:.1f}%) have low confidence - themes may be misaligned")
+        diagnosis["recommended_action"] = "consider_regeneration"
+    
+    # Issue 5: Diminishing returns detected
+    if iteration > 0 and total_potential_improvement < 0.03:
+        diagnosis["issues"].append(f"Quality has plateaued - additional improvement would be minimal (<3%)")
+        diagnosis["recommended_action"] = "plateau_reached"
+    
+    # Issue 6: Near theoretical maximum
+    if avg_confidence >= theoretical_max - 0.02:
+        diagnosis["issues"].append(f"Quality is near theoretical maximum ({theoretical_max:.1%}) given the data characteristics")
+        diagnosis["recommended_action"] = "maximum_reached"
+    
+    # No issues - quality is good!
+    if not diagnosis["issues"]:
+        diagnosis["issues"].append("Quality looks excellent!")
+        diagnosis["recommended_action"] = "none"
+    
+    return diagnosis
+
+
+def improve_quality_one_pass(client: OpenAI, model: str, theme_dict: Dict, assigned_raw: List[Dict], 
+                              diagnosis: Dict, seed: int, low_thresh: float) -> Tuple[List[Dict], Dict, str]:
+    """
+    Execute ONE quality improvement pass based on diagnosis.
+    Returns: (updated_assignments, usage_stats, action_taken)
+    """
+    action = diagnosis["recommended_action"]
+    usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    
+    if action == "none":
+        return assigned_raw, usage, "No improvement needed - quality is excellent"
+    
+    elif action == "verify_low_confidence":
+        # Simple verification pass
+        flagged = [item for item in assigned_raw 
+                   if item.get("assignments") and max([a.get("confidence", 0) for a in item.get("assignments", [])], default=0) < 0.75]
+        
+        if flagged:
+            verified, usage = verify_low_confidence(client, model, theme_dict, flagged, low_thresh=0.75, seed=seed)
+            
+            # Replace in original list
+            by_idx = {x["idx"]: x for x in assigned_raw}
+            for v in verified:
+                by_idx[v["idx"]] = {"idx": v["idx"], "assignments": v.get("assignments", [])}
+            assigned_raw = [by_idx[i] for i in sorted(by_idx.keys())]
+            
+            return assigned_raw, usage, f"Verified {len(verified)} low-confidence items"
+        else:
+            return assigned_raw, usage, "No items needed verification"
+    
+    elif action == "verify_and_analyze":
+        # More aggressive verification
+        flagged = [item for item in assigned_raw 
+                   if item.get("assignments") and max([a.get("confidence", 0) for a in item.get("assignments", [])], default=0) < 0.80]
+        
+        if flagged:
+            verified, usage = verify_low_confidence(client, model, theme_dict, flagged, low_thresh=0.75, seed=seed)
+            
+            by_idx = {x["idx"]: x for x in assigned_raw}
+            for v in verified:
+                by_idx[v["idx"]] = {"idx": v["idx"], "assignments": v.get("assignments", [])}
+            assigned_raw = [by_idx[i] for i in sorted(by_idx.keys())]
+            
+            return assigned_raw, usage, f"Deep verification of {len(verified)} items with theme confusion"
+        else:
+            return assigned_raw, usage, "No items needed verification"
+    
+    elif action == "suggest_new_themes":
+        # This would require adding new themes and re-assigning
+        # For now, do aggressive verification as a first step
+        flagged = [item for item in assigned_raw 
+                   if item.get("assignments") and max([a.get("confidence", 0) for a in item.get("assignments", [])], default=0) < 0.60]
+        
+        if flagged:
+            verified, usage = verify_low_confidence(client, model, theme_dict, flagged, low_thresh=0.50, seed=seed)
+            
+            by_idx = {x["idx"]: x for x in assigned_raw}
+            for v in verified:
+                by_idx[v["idx"]] = {"idx": v["idx"], "assignments": v.get("assignments", [])}
+            assigned_raw = [by_idx[i] for i in sorted(by_idx.keys())]
+            
+            return assigned_raw, usage, f"Verified {len(verified)} very low-confidence items (consider adding new themes if quality doesn't improve)"
+        else:
+            return assigned_raw, usage, "No very low confidence items found"
+    
+    elif action == "consider_regeneration":
+        # This is a severe quality issue - suggest manual intervention
+        return assigned_raw, usage, "⚠️ Fundamental theme quality issue detected - consider regenerating themes with different question context or reviewing theme dictionary manually"
+    
+    return assigned_raw, usage, "Unknown action"
 
 def calibrate_confidence(confidence: float, response_text: str, theme_id: str) -> float:
     """Calibrate confidence based on response characteristics and theme fit"""
@@ -896,7 +1118,7 @@ def calibrate_confidence(confidence: float, response_text: str, theme_id: str) -
     # Ensure confidence stays within bounds
     return max(0.0, min(1.0, calibrated))
 
-def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str], freq: List[int], seed: int | None, progress_bar, status_text, question_text: str = None) -> Tuple[Dict[str, Any], Dict[str, int]]:
+def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str], freq: List[int], seed: int | None, progress_bar, status_text, question_text: str = None, allow_multicode: bool = True) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """Create a hierarchical theme dictionary with detailed progress tracking."""
     
     # Pre-filter non-responses and low-quality responses
@@ -941,9 +1163,11 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
         
         # Build prompt with optional question context
         if question_text and question_text.strip():
-            user = THEME_DISCOVERY_USER + f"\n\n**Survey Question:** {question_text}\n\nWeighted responses (JSON array):\n" + payload
+            theme_prompt = get_theme_discovery_prompt(allow_multicode)
+            user = theme_prompt + f"\n\n**Survey Question:** {question_text}\n\nWeighted responses (JSON array):\n" + payload
         else:
-            user = THEME_DISCOVERY_USER + "\n\nWeighted responses (JSON array):\n" + payload
+            theme_prompt = get_theme_discovery_prompt(allow_multicode)
+            user = theme_prompt + "\n\nWeighted responses (JSON array):\n" + payload
         
         def make_request():
             return oai_json_completion(client, model, THEME_DISCOVERY_SYSTEM, user, seed)
@@ -965,18 +1189,19 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
         def process_theme_chunk(chunk):
             payload = json.dumps(chunk)
             # Build prompt with optional question context
+            theme_prompt = get_theme_discovery_prompt(allow_multicode)
             if question_text and question_text.strip():
-                user = THEME_DISCOVERY_USER + f"\n\n**Survey Question:** {question_text}\n\nWeighted responses (JSON array):\n" + payload
+                user = theme_prompt + f"\n\n**Survey Question:** {question_text}\n\nWeighted responses (JSON array):\n" + payload
             else:
-                user = THEME_DISCOVERY_USER + "\n\nWeighted responses (JSON array):\n" + payload
+                user = theme_prompt + "\n\nWeighted responses (JSON array):\n" + payload
             
             def make_chunk_request():
                 return oai_json_completion(client, model, THEME_DISCOVERY_SYSTEM, user, seed)
             
             return retry_with_backoff(make_chunk_request)
         
-        # Use minimal parallelism for cost optimization
-        max_workers = 1  # Sequential processing to minimize costs
+        # Use configurable parallelism (bounded by number of chunks)
+        max_workers = max(1, min(parallel_requests, len(chunks)))
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_chunk = {executor.submit(process_theme_chunk, chunk): i for i, chunk in enumerate(chunks)}
@@ -1208,6 +1433,13 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
             # Fallback for backward compatibility
             data = data if isinstance(data, list) else []
         
+        # VALIDATION: Check if AI returned assignments for all unique responses
+        expected_count = len(unique_rows_for_ai)
+        actual_count = len(data)
+        if actual_count < expected_count:
+            st.warning(f"⚠️ AI returned {actual_count} assignments but expected {expected_count}. Some responses may be missing assignments.")
+            st.caption(f"This can happen if the AI response was truncated. The system will add fallback assignments.")
+        
         # All responses processed by GPT-5 - no fast assignment merging needed
         final_unique = data
         
@@ -1218,6 +1450,20 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
         # Add back the non-answer assignments for filtered responses
         all_assignments = expanded_assignments + non_answer_assignments
         all_assignments.sort(key=lambda x: x["idx"])  # Sort by original index
+        
+        # FINAL VALIDATION: Ensure every index from 0 to len(rows)-1 has an assignment
+        assigned_indices = {a["idx"] for a in all_assignments}
+        missing_indices = set(range(len(rows))) - assigned_indices
+        
+        if missing_indices:
+            st.error(f"❌ CRITICAL: {len(missing_indices)} responses are missing assignments! Adding fallbacks...")
+            for idx in missing_indices:
+                all_assignments.append({
+                    "idx": idx,
+                    "assignments": [{"theme_id": non_answer_theme_id or "T1.1", "confidence": 0.3}]
+                })
+                st.caption(f"   Missing index: {idx}")
+            all_assignments.sort(key=lambda x: x["idx"])
         
         return all_assignments, usage
     
@@ -1238,6 +1484,20 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
         # Add back the non-answer assignments for filtered responses
         final_assignments = expanded_assignments + non_answer_assignments
         final_assignments.sort(key=lambda x: x["idx"])  # Sort by original index
+        
+        # FINAL VALIDATION: Ensure every index from 0 to len(rows)-1 has an assignment
+        assigned_indices = {a["idx"] for a in final_assignments}
+        missing_indices = set(range(len(rows))) - assigned_indices
+        
+        if missing_indices:
+            st.error(f"❌ CRITICAL: {len(missing_indices)} responses are missing assignments! Adding fallbacks...")
+            for idx in missing_indices:
+                final_assignments.append({
+                    "idx": idx,
+                    "assignments": [{"theme_id": non_answer_theme_id or "T1.1", "confidence": 0.3}]
+                })
+                st.caption(f"   Missing index: {idx}")
+            final_assignments.sort(key=lambda x: x["idx"])
         
         st.success("✅ Assignment complete!")
         return final_assignments, total_usage
@@ -1378,8 +1638,8 @@ def assign_codes_with_progress(client: OpenAI, model: str, theme_dict: Dict[str,
         
         return chunk_assignments, chunk_usage
     
-    # Use minimal parallelism for cost optimization
-    max_workers = min(3, len(all_chunks))  # Reduced from 50 to 3 for cost savings
+    # Use configurable parallelism (bounded by number of chunks)
+    max_workers = max(1, min(parallel_requests, len(all_chunks)))
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all chunks for processing
@@ -1582,7 +1842,7 @@ def slim_theme_for_assignment(theme_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def expand_deduplicated_results(unique_assignments: List[Dict[str, Any]], response_to_indices: Dict[str, List[int]]) -> List[Dict[str, Any]]:
-    """Expand deduplicated results back to all original responses"""
+    """Expand deduplicated results back to all original responses with fallback for missing assignments"""
     # The unique_assignments contain assignments with idx values that correspond to 
     # the position of unique responses (0, 1, 2, ...), not the original row indices
     
@@ -1601,14 +1861,47 @@ def expand_deduplicated_results(unique_assignments: List[Dict[str, Any]], respon
     
     # Expand to all original responses
     expanded_assignments = []
-    for text, original_indices in response_to_indices.items():
+    missing_count = 0
+    missing_texts = []
+    
+    for unique_idx, (text, original_indices) in enumerate(response_to_indices.items()):
         if text in text_to_assignment:
             base_assignment = text_to_assignment[text]
+            # Validate that base_assignment has assignments array
+            if not base_assignment.get("assignments"):
+                st.warning(f"⚠️ Assignment for unique_idx {unique_idx} exists but has empty assignments array!")
+                base_assignment["assignments"] = [{"theme_id": "T1.1", "confidence": 0.3}]
+            
             # Create assignments for all original indices with this text
             for original_idx in original_indices:
                 expanded_assignment = base_assignment.copy()
                 expanded_assignment["idx"] = original_idx
                 expanded_assignments.append(expanded_assignment)
+        else:
+            # CRITICAL FIX: AI didn't return assignment for this unique text
+            # Create fallback assignment for all instances
+            missing_count += len(original_indices)
+            missing_texts.append(text[:80])
+            
+            for original_idx in original_indices:
+                # Create a low-confidence fallback assignment
+                expanded_assignments.append({
+                    "idx": original_idx,
+                    "assignments": [{"theme_id": "T1.1", "confidence": 0.3}]  # Low confidence fallback
+                })
+    
+    if missing_count > 0:
+        st.error(f"❌ {missing_count} responses were missing AI assignments - added fallback assignments.")
+        with st.expander("🔍 Debug: Missing Assignments Details"):
+            st.write(f"**Total unique texts sent to AI:** {len(unique_texts)}")
+            st.write(f"**Assignments returned by AI:** {len(unique_assignments)}")
+            st.write(f"**Missing unique assignments:** {len(missing_texts)}")
+            st.write(f"**Total original indices affected:** {missing_count}")
+            if missing_texts:
+                st.write("**Sample missing texts:**")
+                for txt in missing_texts[:5]:
+                    st.caption(f"• {txt}")
+            st.write("**Possible causes:** API response truncation, rate limiting, or AI output format issues")
     
     # Sort by original index to maintain order
     expanded_assignments.sort(key=lambda x: x["idx"])
@@ -1737,7 +2030,7 @@ def analyze_theme_distribution(coded_df: pd.DataFrame, tiny_threshold: float, th
     total_responses = len(coded_df)
     
     # Count responses in different categories
-    subtheme1_col = f"{coded_df.columns[coded_df.columns.str.contains('_SubTheme1')][0]}" if any(coded_df.columns.str.contains("_SubTheme1")) else "MajorTheme1"
+    subtheme1_col = f"{coded_df.columns[coded_df.columns.str.contains('_SubTheme1')][0]}" if any(coded_df.columns.str.contains("_SubTheme1")) else f"{coded_df.columns[coded_df.columns.str.contains('_MajorTheme1')][0]}"
     other_themes = coded_df[coded_df[subtheme1_col].str.contains("Other", case=False, na=False)]
     not_applicable = coded_df[coded_df[subtheme1_col].str.contains("Not applicable", case=False, na=False)]
     manual_review_needed = coded_df.get("ManualReview", pd.Series([False] * len(coded_df), dtype=bool))
@@ -1824,7 +2117,7 @@ def analyze_coverage_accuracy(coded_df: pd.DataFrame, theme_dict: Dict[str, Any]
                 theme_estimates[sub.get("label", "")] = sub.get("approx_pct", 0.0)
     
     # Compare with actual counts
-    subtheme1_col = f"{coded_df.columns[coded_df.columns.str.contains('_SubTheme1')][0]}" if any(coded_df.columns.str.contains("_SubTheme1")) else "MajorTheme1"
+    subtheme1_col = f"{coded_df.columns[coded_df.columns.str.contains('_SubTheme1')][0]}" if any(coded_df.columns.str.contains("_SubTheme1")) else f"{coded_df.columns[coded_df.columns.str.contains('_MajorTheme1')][0]}"
     actual_counts = coded_df[subtheme1_col].value_counts()
     
     for theme_label, estimated_pct in theme_estimates.items():
@@ -1891,7 +2184,7 @@ def map_theme_id_to_major(theme_df: pd.DataFrame) -> Dict[str, str]:
 # ------------------------------
 
 st.set_page_config(
-    page_title="Express Explorer Thematic Coder", 
+    page_title="Future Partners Open-Ended Coding Tool", 
     layout="wide",
     initial_sidebar_state="expanded",
     page_icon="📊"
@@ -1941,7 +2234,7 @@ st.markdown("""
 # Header
 st.markdown("""
 <div class="main-header">
-    <h1>📊 Express Explorer Thematic Coder</h1>
+    <h1>📊 Future Partners Open-Ended Coding Tool</h1>
     <p>Upload open‑ended survey responses, auto‑discover Major and Sub‑themes, and export professionally coded data.</p>
 </div>
 """, unsafe_allow_html=True)
@@ -1950,21 +2243,16 @@ with st.sidebar:
     st.header("Settings")
     model = "gpt-5"
     seed = 42  # Hard-coded for deterministic results
-    st.info("🤖 **High Quality Mode: GPT-5 for All Steps**")
-    st.caption("🎯 **Theme Generation**: GPT-5 (highest quality)")
-    st.caption("🎯 **Assignment**: GPT-5 (highest accuracy)")
-    st.caption("💡 GPT-5: 500K TPM, 500 RPM - optimized for cost efficiency")
-    st.caption("🔒 Deterministic mode enabled (same input → same output)")
     allow_multicode = st.toggle("Multi‑coding", value=True)
+    # Control parallelism of API requests for speed vs. rate limits
+    parallel_requests = st.slider("Parallel requests", min_value=1, max_value=8, value=3, help="Increase for faster processing if your API rate limits allow it")
     max_codes = 3
     single_or_multi = "Multi" if allow_multicode else "Single"
 
-    low_thresh = st.slider("Low confidence threshold", 0.0, 1.0, 0.60, 0.01)
-    
-    st.divider()
-    st.subheader("Theme count")
-    auto_theme = st.toggle("Auto decide theme count", value=True)
-    theme_min, theme_max = st.slider("Preferred range", min_value=3, max_value=20, value=(6, 12))
+# Hard-coded settings for consistent, abstracted behavior
+low_thresh = 0.60  # Low confidence threshold
+auto_theme = True  # Auto decide theme count
+theme_min, theme_max = (6, 12)  # Preferred theme range
 
 uploaded = st.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx"])
 
@@ -2025,38 +2313,35 @@ with col2:
 
 # Theme upload functionality
 if theme_source == "Upload existing themes":
-    uploaded_theme_file = st.file_uploader("Upload theme dictionary (JSON or XLSX)", type=["json", "xlsx"], key="theme_upload")
+    uploaded_theme_file = st.file_uploader("Upload theme dictionary (XLSX)", type=["xlsx"], key="theme_upload")
     
     if uploaded_theme_file is not None:
         try:
-            if uploaded_theme_file.name.lower().endswith('.json'):
-                theme_dict = json.load(uploaded_theme_file)
-            else:  # XLSX
-                theme_df_upload = pd.read_excel(uploaded_theme_file)
-                # Convert XLSX to theme dictionary format
-                theme_dict = {"major_themes": []}
-                current_major = None
-                
-                for _, row in theme_df_upload.iterrows():
-                    if row.get("Level") == "Major":
-                        current_major = {
-                            "id": row.get("ThemeID", ""),
-                            "label": row.get("Label", ""),
-                            "definition": row.get("ShortDefinition", ""),
-                            "subs": []
-                        }
-                        theme_dict["major_themes"].append(current_major)
-                    elif row.get("Level") == "Sub" and current_major:
-                        sub_theme = {
-                            "id": row.get("ThemeID", ""),
-                            "label": row.get("Label", ""),
-                            "definition": row.get("ShortDefinition", ""),
-                            "examples": row.get("ExampleQuotes", "").split("; ") if pd.notna(row.get("ExampleQuotes")) else []
-                        }
-                        current_major["subs"].append(sub_theme)
-                
-                st.session_state["theme_dict"] = theme_dict
-                st.success("Theme dictionary uploaded successfully!")
+            theme_df_upload = pd.read_excel(uploaded_theme_file)
+            # Convert XLSX to theme dictionary format
+            theme_dict = {"major_themes": []}
+            current_major = None
+            
+            for _, row in theme_df_upload.iterrows():
+                if row.get("Level") == "Major":
+                    current_major = {
+                        "id": row.get("ThemeID", ""),
+                        "label": row.get("Label", ""),
+                        "definition": row.get("ShortDefinition", ""),
+                        "subs": []
+                    }
+                    theme_dict["major_themes"].append(current_major)
+                elif row.get("Level") == "Sub" and current_major:
+                    sub_theme = {
+                        "id": row.get("ThemeID", ""),
+                        "label": row.get("Label", ""),
+                        "definition": row.get("ShortDefinition", ""),
+                        "examples": row.get("ExampleQuotes", "").split("; ") if pd.notna(row.get("ExampleQuotes")) else []
+                    }
+                    current_major["subs"].append(sub_theme)
+            
+            st.session_state["theme_dict"] = theme_dict
+            st.success("Theme dictionary uploaded successfully!")
 
         except Exception as e:
             st.error(f"Error loading theme file: {str(e)}")
@@ -2153,7 +2438,7 @@ if theme_source == "Generate new themes":
             # Theme discovery with optional question context (no priority themes)
             if question_text and question_text.strip():
                 st.info(f"📝 Using question context: \"{question_text}\"")
-            theme_dict, usage_theme = build_theme_frame_with_progress(client, model, unique_texts, unique_freqs, seed, theme_progress, theme_status, question_text)
+            theme_dict, usage_theme = build_theme_frame_with_progress(client, model, unique_texts, unique_freqs, seed, theme_progress, theme_status, question_text, allow_multicode)
             st.session_state["theme_dict"] = theme_dict
             
             theme_end_time = time.time()
@@ -2198,57 +2483,81 @@ if theme_source == "Generate new themes":
             total_timer.metric("⏱️ Total Time", f"{int(total_elapsed//60)}:{int(total_elapsed%60):02d}")
             assign_timer.metric("🏷️ Assignment", f"{int(assign_duration//60)}:{int(assign_duration%60):02d}")
             
-            # Step 2b: Auto-verify low confidence assignments
-            st.write("🔍 **Auto-Verifying Low Confidence Responses**")
-            verify_progress = st.progress(0)
-            verify_status = st.empty()
-            verify_timer = st.empty()
+            # Step 2b: Smart Quality Assessment & Auto-Improvement
+            st.write("🎯 **Smart Quality Assessment**")
+            quality_progress = st.progress(0)
+            quality_status = st.empty()
+            quality_timer = st.empty()
             
-            verify_start_time = time.time()
-            verify_status.text("Identifying low confidence responses...")
-            verify_progress.progress(10)
-            verify_timer.metric("🔍 Verification", "Running...")
+            quality_start_time = time.time()
+            quality_status.text("Analyzing quality...")
+            quality_progress.progress(10)
+            quality_timer.metric("🎯 Quality Check", "Running...")
             
-            # Identify low confidence responses
-            low = float(low_thresh)
-            flagged = []
-            for item in st.session_state["assigned_raw"]:
-                confs = [a.get("confidence", 0.0) for a in item.get("assignments", [])]
-                top_conf = max(confs) if confs else 0.0
-                if top_conf < low:
-                    flagged.append(item)
+            # Build preliminary coded_df for diagnosis
+            temp_assign_map = {x["idx"]: x for x in st.session_state["assigned_raw"]}
+            temp_rows = []
+            for i in range(len(ser)):
+                item = temp_assign_map.get(i, {"assignments": []})
+                assigns = item.get("assignments", [])
+                if assigns:
+                    temp_rows.append({"confidence": assigns[0].get("confidence", 0.0)})
+            temp_df = pd.DataFrame(temp_rows)
             
-            verify_progress.progress(25)
+            # Diagnose quality issues (iteration 0 - first pass)
+            diagnosis = diagnose_quality_issues(st.session_state["assigned_raw"], theme_dict, temp_df, iteration=0)
+            avg_conf = diagnosis["avg_confidence"]
             
-            if flagged:
-                verify_status.text(f"Re-checking {len(flagged)} low-confidence assignments...")
-                verify_progress.progress(50)
+            quality_progress.progress(30)
+            quality_status.text(f"Initial confidence: {avg_conf:.1%}")
+            
+            # Auto-improve if below 75% threshold AND user enabled auto-improve
+            if avg_conf < 0.75 and run_auto_improve:
+                quality_status.text(f"🔄 Auto-improving quality (below 75% threshold)...")
+                quality_progress.progress(50)
                 
-                verified, usage_verify = verify_low_confidence(client, model, theme_dict, flagged, low_thresh=low, seed=seed)
+                improved, usage_quality, action = improve_quality_one_pass(
+                    client, model, theme_dict, st.session_state["assigned_raw"], 
+                    diagnosis, seed, low_thresh
+                )
                 
-                # Replace items by idx - ensure clean structure
-                by_idx = {x["idx"]: x for x in st.session_state["assigned_raw"]}
-                for v in verified:
-                    cleaned_item = {
-                        "idx": v["idx"],
-                        "assignments": v.get("assignments", [])
-                    }
-                    by_idx[v["idx"]] = cleaned_item
-                st.session_state["assigned_raw"] = [by_idx[i] for i in sorted(by_idx.keys())]
+                st.session_state["assigned_raw"] = improved
                 
-                verify_progress.progress(100)
-                verify_status.text(f"✅ Verified {len(verified)} low-confidence assignments!")
+                # Re-diagnose after improvement (iteration 1 now)
+                diagnosis = diagnose_quality_issues(improved, theme_dict, temp_df, iteration=1)
+                new_avg_conf = diagnosis["avg_confidence"]
+                improvement = new_avg_conf - avg_conf
+                
+                quality_progress.progress(100)
+                quality_status.text(f"✅ {action}")
+                st.success(f"📈 Quality improved: {avg_conf:.1%} → {new_avg_conf:.1%} (+{improvement:.1%})")
+                
+                # Store for later iteration
+                st.session_state["quality_diagnosis"] = diagnosis
+                st.session_state["quality_iteration"] = 1
+                
+            elif avg_conf < 0.90:
+                quality_progress.progress(100)
+                quality_status.text(f"✅ Quality check complete: {avg_conf:.1%}")
+                if run_auto_improve:
+                    st.info(f"💡 Quality is good ({avg_conf:.1%}). You can improve it further with additional passes, but costs may increase.")
+                st.session_state["quality_diagnosis"] = diagnosis
+                st.session_state["quality_iteration"] = 0
+                
             else:
-                verify_progress.progress(100)
-                verify_status.text("✅ All assignments have high confidence!")
+                quality_progress.progress(100)
+                quality_status.text(f"✅ Excellent quality: {avg_conf:.1%}")
+                st.success(f"🎉 Excellent quality! Average confidence: {avg_conf:.1%}")
+                st.session_state["quality_diagnosis"] = diagnosis
+                st.session_state["quality_iteration"] = 0
             
-            verify_end_time = time.time()
-            verify_duration = verify_end_time - verify_start_time
+            quality_end_time = time.time()
+            quality_duration = quality_end_time - quality_start_time
             
             # Update timers
             total_elapsed = time.time() - overall_start_time
             total_timer.metric("⏱️ Total Time", f"{int(total_elapsed//60)}:{int(total_elapsed%60):02d}")
-            verify_timer.metric("🔍 Verification", f"{int(verify_duration//60)}:{int(verify_duration%60):02d}")
+            quality_timer.metric("🎯 Quality Check", f"{int(quality_duration//60)}:{int(quality_duration%60):02d}")
             
             # Step 3: Build coded dataframe
             st.write("📊 **Building Coded Dataset**")
@@ -2282,18 +2591,7 @@ if theme_source == "Generate new themes":
         assign_minutes = int(assign_duration // 60)
         assign_seconds = int(assign_duration % 60)
         
-        st.markdown(f"""
-        <div class="success-box">
-            <h4>✅ Theme Processing Complete!</h4>
-            <p><strong>⏱️ Total Processing Time: {total_minutes}:{total_seconds:02d}</strong></p>
-            <ul>
-                <li>🎯 Theme Generation: {theme_minutes}:{theme_seconds:02d}</li>
-                <li>🏷️ Theme Assignment: {assign_minutes}:{assign_seconds:02d}</li>
-                <li>📊 Dataset Building: <1 second</li>
-            </ul>
-            <p>Your themes have been generated and assigned to all responses. Review the results below and use the verification tools if needed.</p>
-        </div>
-        """, unsafe_allow_html=True)
+        st.success(f"🎉 **Theme Processing Complete!** Total time: {total_minutes}:{total_seconds:02d} (Theme Generation: {theme_minutes}:{theme_seconds:02d}, Assignment: {assign_minutes}:{assign_seconds:02d})")
 
 if "theme_dict" not in st.session_state or "assigned_raw" not in st.session_state:
     st.stop()
@@ -2305,39 +2603,21 @@ st.dataframe(theme_df, width="stretch")
 
 # Theme export functionality
 st.write("**Export Theme Dictionary:**")
-col1, col2 = st.columns(2)
 
-with col1:
-    # JSON export
-    theme_json = json.dumps(st.session_state["theme_dict"], indent=2)
-    st.download_button(
-        "📄 Download as JSON",
-        data=theme_json,
-        file_name=f"theme_dictionary_{today_stamp()}.json",
-        mime="application/json",
-        help="Download theme dictionary as JSON for easy import back into the tool"
-    )
+# XLSX export
+buf = io.BytesIO()
+with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+    theme_df.to_excel(writer, sheet_name="Theme Dictionary", index=False)
 
-with col2:
-    # XLSX export
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        theme_df.to_excel(writer, sheet_name="Theme Dictionary", index=False)
-    
-    st.download_button(
-        "📊 Download as XLSX",
-        data=buf.getvalue(),
-        file_name=f"theme_dictionary_{today_stamp()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        help="Download theme dictionary as XLSX for easy import back into the tool"
-    )
+st.download_button(
+    "📊 Download as XLSX",
+    data=buf.getvalue(),
+    file_name=f"theme_dictionary_{today_stamp()}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    help="Download theme dictionary as XLSX for easy import back into the tool"
+)
 
-st.caption("💡 **Tip**: Use these exports to save your themes and import them later using the 'Upload existing themes' option!")
-
-# Show JSON preview
-with st.expander("🔍 Preview JSON Format"):
-    st.code(theme_json[:1000] + "..." if len(theme_json) > 1000 else theme_json, language="json")
-    st.caption("This JSON format can be directly imported using the 'Upload existing themes' option above.")
+st.caption("💡 **Tip**: Use this export to save your themes and import them later using the 'Upload existing themes' option!")
 
 # Comprehensive export (themes + coded data)
 st.write("**Complete Export (Themes + Coded Data):**")
@@ -2365,8 +2645,8 @@ with pd.ExcelWriter(comprehensive_buf, engine="xlsxwriter") as writer:
                 
                 sample_coded_rows.append({
                     "Response_Index": i,
-                    "MajorTheme1": label_map.get(primary_major, ""),
-                    "SubTheme1": label_map.get(primary_theme_id, "") if primary_sub else "",
+                    f"{text_col}_MajorTheme1": label_map.get(primary_major, ""),
+                    f"{text_col}_SubTheme1": label_map.get(primary_theme_id, "") if primary_sub else "",
                     "Confidence": assigns[0].get("confidence", 0.0),
                     "ThemeID": primary_theme_id
                 })
@@ -2386,6 +2666,25 @@ st.download_button(
 # Build coded DataFrame first
 assign_map = {x["idx"]: x for x in st.session_state["assigned_raw"]}
 
+# Normalize assignments: force all theme_ids to sub-level IDs so majors and subs count match
+def to_sub_id(theme_id: str) -> str:
+    if not theme_id:
+        return theme_id
+    # If already a sub (has a parent), keep as is
+    if theme_id in parent_map and pd.notna(parent_map[theme_id]) and str(parent_map[theme_id]).strip() != "":
+        return theme_id
+    # If it's a major, try to map to a reasonable sub: prefer an "Other"-like sub first, else the first sub
+    if theme_id in label_map:
+        # Find candidate subs under this major
+        subs = theme_df[ (theme_df["Level"] == "Sub") & (theme_df["ParentThemeID"] == theme_id) ]
+        if not subs.empty:
+            # Prefer an Other-like sub if present
+            other_like = subs[ subs["Label"].str.contains("Other|General|Misc", case=False, na=False) ]
+            chosen = other_like.iloc[0] if not other_like.empty else subs.iloc[0]
+            return str(chosen["ThemeID"])
+    # Fallback: return original id
+    return theme_id
+
 # Theme map helpers
 major_map = map_theme_id_to_major(theme_df)
 label_map = {r["ThemeID"]: r["Label"] for _, r in theme_df.iterrows()}
@@ -2398,7 +2697,9 @@ for i in range(len(df)):
     assigns = sorted(assigns, key=lambda a: a.get("confidence", 0.0), reverse=True)
     assigns = assigns[: (max_codes if allow_multicode else 1)]
 
-    codes = [a.get("theme_id") for a in assigns]
+    # Normalize codes to sub-level IDs so majors/subs stay aligned
+    raw_codes = [a.get("theme_id") for a in assigns]
+    codes = [to_sub_id(cid) for cid in raw_codes]
     confs = [float(a.get("confidence", 0.0)) for a in assigns]
 
     # Calculate average confidence
@@ -2414,30 +2715,29 @@ for i in range(len(df)):
     # Add raw open end text (using variable label as column name)
     row[text_col] = ser.iloc[i]
     
-    # Add Major themes - one for each code, showing which Major theme each sub-theme belongs to
+    # Add Major themes - derived strictly from sub-level codes
     # MajorTheme1 is always populated (even for single-coded responses)
     if len(codes) > 0:
         major1_id = major_map.get(codes[0], "")
-        row["MajorTheme1"] = label_map.get(major1_id, "")
+        row[f"{text_col}_MajorTheme1"] = label_map.get(major1_id, "")
     else:
-        row["MajorTheme1"] = ""
+        row[f"{text_col}_MajorTheme1"] = ""
     
     # MajorTheme2 only populated if 2nd code exists and has confidence ≥ 0.6
     if len(codes) > 1 and confs[1] >= 0.6:
         major2_id = major_map.get(codes[1], "")
-        row["MajorTheme2"] = label_map.get(major2_id, "")
+        row[f"{text_col}_MajorTheme2"] = label_map.get(major2_id, "")
     else:
-        row["MajorTheme2"] = ""
+        row[f"{text_col}_MajorTheme2"] = ""
     
     # MajorTheme3 only populated if 3rd code exists and has confidence ≥ 0.6
     if len(codes) > 2 and confs[2] >= 0.6:
         major3_id = major_map.get(codes[2], "")
-        row["MajorTheme3"] = label_map.get(major3_id, "")
+        row[f"{text_col}_MajorTheme3"] = label_map.get(major3_id, "")
     else:
-        row["MajorTheme3"] = ""
+        row[f"{text_col}_MajorTheme3"] = ""
     
-    # Add sub-themes with variable label prefix
-    # SubTheme1 is always populated (even for single-coded responses)
+    # Add sub-themes with variable label prefix (always sub-level after normalization)
     row[f"{text_col}_SubTheme1"] = label_map.get(codes[0], "") if len(codes) > 0 else ""
     
     # SubTheme2 only populated for multi-coded high-confidence responses
@@ -2461,19 +2761,138 @@ coded_df = pd.DataFrame(coded_rows)
 
 # Order columns: [IDs] [RawOpenEnd] [MajorTheme1/2/3] [SubTheme1/2/3] [Confidence]
 id_before = pass_id_cols.copy()
-base_cols = [text_col, "MajorTheme1", "MajorTheme2", "MajorTheme3", f"{text_col}_SubTheme1", f"{text_col}_SubTheme2", f"{text_col}_SubTheme3", "Confidence"]
+base_cols = [text_col, f"{text_col}_MajorTheme1", f"{text_col}_MajorTheme2", f"{text_col}_MajorTheme3", f"{text_col}_SubTheme1", f"{text_col}_SubTheme2", f"{text_col}_SubTheme3", "Confidence"]
 ordered_cols = id_before + base_cols
 coded_df = coded_df[ordered_cols]
 
-# Review & Verification Section
+# Review & Quality Improvement Section
 st.divider()
-st.subheader("Review & Verification")
+st.subheader("Quality Dashboard & Iterative Improvement")
+
+# Show quality diagnosis
+if "quality_diagnosis" in st.session_state:
+    diagnosis = st.session_state["quality_diagnosis"]
+    avg_conf = diagnosis["avg_confidence"]
+    iteration = st.session_state.get("quality_iteration", 0)
+    
+    # Quality overview
+    st.write("**📊 Quality Overview:**")
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        conf_status = "🎉 Excellent" if avg_conf >= 0.90 else "✅ Good" if avg_conf >= 0.75 else "⚠️ Needs Improvement"
+        st.metric("Average Confidence", f"{avg_conf:.1%}", conf_status)
+    
+    with col2:
+        st.metric("Excellent (≥90%)", f"{diagnosis['confidence_distribution']['excellent']:.1f}%")
+    
+    with col3:
+        st.metric("Good (75-90%)", f"{diagnosis['confidence_distribution']['good']:.1f}%")
+    
+    with col4:
+        marginal_poor = diagnosis['confidence_distribution']['marginal'] + diagnosis['confidence_distribution']['poor']
+        st.metric("Needs Review (<75%)", f"{marginal_poor:.1f}%")
+    
+    # Show issues and recommendations
+    if diagnosis["issues"]:
+        with st.expander("🔍 Quality Diagnosis", expanded=(avg_conf < 0.90)):
+            st.write("**Identified Issues:**")
+            for issue in diagnosis["issues"]:
+                if "excellent" in issue.lower():
+                    st.success(f"✅ {issue}")
+                else:
+                    st.info(f"• {issue}")
+            
+            if diagnosis["recommended_action"] not in ["none", "plateau_reached", "maximum_reached"]:
+                st.write(f"**Recommended Action:** `{diagnosis['recommended_action']}`")
+                st.caption(f"Expected improvement: +{diagnosis['estimated_improvement']*100:.1f}%")
+                st.caption(f"Theoretical maximum for this dataset: {diagnosis['theoretical_max']:.1%}")
+            elif diagnosis["recommended_action"] in ["plateau_reached", "maximum_reached"]:
+                st.write(f"**Status:** Quality has reached optimal level for this dataset")
+                st.caption(f"Theoretical maximum: {diagnosis['theoretical_max']:.1%}")
+    
+    # Iterative improvement button - only show if improvement is worth it
+    if avg_conf < 0.90 and diagnosis["recommended_action"] not in ["none", "plateau_reached", "maximum_reached", "consider_regeneration"]:
+        
+        # Check if improvement is worth it
+        if diagnosis["worth_improving"]:
+            st.write("**🚀 Improve Quality:**")
+            
+            improve_col1, improve_col2 = st.columns([3, 1])
+            with improve_col1:
+                expected_new = avg_conf + diagnosis["estimated_improvement"]
+                if iteration > 0:
+                    st.info(f"Pass {iteration + 1} available: Estimated improvement +{diagnosis['estimated_improvement']*100:.1f}% → {expected_new:.1%}")
+                else:
+                    if avg_conf >= 0.75:
+                        st.info(f"Quality is good ({avg_conf:.1%}), but can reach {expected_new:.1%} (estimated +{diagnosis['estimated_improvement']*100:.1f}%). Click to improve.")
+                    else:
+                        st.warning(f"Quality can be improved from {avg_conf:.1%} to ~{expected_new:.1%} (estimated +{diagnosis['estimated_improvement']*100:.1f}%).")
+            
+            with improve_col2:
+                if st.button("🔄 Improve Quality", type="primary" if avg_conf < 0.75 else "secondary"):
+                    with st.spinner("Improving quality..."):
+                        # Run improvement pass
+                        improved, usage_improve, action = improve_quality_one_pass(
+                            client, model, st.session_state["theme_dict"], 
+                            st.session_state["assigned_raw"], 
+                            diagnosis, seed, low_thresh
+                        )
+                        
+                        # Update session state
+                        st.session_state["assigned_raw"] = improved
+                        st.session_state["quality_iteration"] = iteration + 1
+                        
+                        # Re-diagnose with updated iteration count
+                        new_diagnosis = diagnose_quality_issues(improved, st.session_state["theme_dict"], coded_df, iteration=iteration + 1)
+                        new_avg_conf = new_diagnosis["avg_confidence"]
+                        improvement = new_avg_conf - avg_conf
+                        
+                        st.session_state["quality_diagnosis"] = new_diagnosis
+                        
+                        # Show results
+                        if improvement >= 0.03:
+                            st.success(f"✅ {action}")
+                            st.success(f"📈 Pass {iteration + 1} complete: {avg_conf:.1%} → {new_avg_conf:.1%} (+{improvement:.1%})")
+                        elif improvement > 0:
+                            st.success(f"✅ {action}")
+                            st.info(f"📊 Pass {iteration + 1} complete: {avg_conf:.1%} → {new_avg_conf:.1%} (+{improvement:.1%})")
+                            st.caption(f"⚠️ Diminishing returns detected. Further improvements unlikely (<3% gain).")
+                        else:
+                            st.info(f"ℹ️ {action}")
+                            st.warning(f"⚠️ Quality didn't improve. This is likely as good as it gets for this dataset.")
+                        
+                        st.rerun()
+        else:
+            # Improvement not worth it
+            st.info(f"💡 Further improvement would be minimal (estimated +{diagnosis['estimated_improvement']*100:.1f}%). Quality is near optimal for this dataset.")
+            st.caption(f"**Theoretical maximum:** {diagnosis['theoretical_max']:.1%}")
+    
+    elif avg_conf < 0.90 and diagnosis["recommended_action"] in ["plateau_reached", "maximum_reached"]:
+        st.success(f"🎉 **Quality has reached plateau!**")
+        st.info(f"📊 Current: {avg_conf:.1%} | Theoretical max: {diagnosis['theoretical_max']:.1%}")
+        st.caption(f"Based on {diagnosis['inherently_ambiguous_count']} inherently ambiguous responses and {diagnosis['improvable_count']} improvable items, this is as good as it gets without regenerating themes.")
+    
+    elif diagnosis["recommended_action"] == "consider_regeneration":
+        st.error(f"⚠️ **Fundamental Quality Issue Detected**")
+        st.warning(f"Current confidence: {avg_conf:.1%} - Majority of items have low confidence")
+        st.info(f"💡 **Recommendation:** The theme dictionary may not align well with your data. Consider:")
+        st.caption("   • Reviewing and editing the theme dictionary manually")
+        st.caption("   • Regenerating themes (re-run 'Discover Themes' step)")
+        st.caption("   • Providing more specific question context")
+    
+    elif avg_conf >= 0.90:
+        st.success(f"🎉 **Excellent quality achieved!** Average confidence: {avg_conf:.1%}")
+        if iteration > 0:
+            st.caption(f"Quality improvement passes completed: {iteration}")
+else:
+    st.info("ℹ️ Quality diagnosis will appear after running theme discovery and assignment.")
 
 # Show coded data preview
 st.write("**Coded Data Preview:**")
 st.dataframe(coded_df.head(20), width="stretch")
 
-# Identify low confidence responses
+# Identify low confidence responses (for manual review if needed)
 low = float(low_thresh)
 flagged = []
 for item in st.session_state["assigned_raw"]:
@@ -2484,165 +2903,10 @@ for item in st.session_state["assigned_raw"]:
 
 # Review summary (verification already done automatically)
 if flagged:
-    st.write(f"**ℹ️ {len(flagged)} responses were auto-verified (initially below {low_thresh} confidence)**")
-    st.caption("These responses were automatically re-checked during the coding process.")
-    
-    # Analyze low-confidence patterns for theme suggestions
-    pattern_analysis = analyze_low_confidence_patterns(flagged)
-    
-    if pattern_analysis["patterns"]:
-        with st.expander("🔍 **Theme Pattern Analysis** - Potential New Themes", expanded=False):
-            st.write("**Detected patterns in low-confidence responses:**")
-            
-            for pattern in pattern_analysis["patterns"]:
-                st.write(f"**{pattern['pattern_name']}** ({pattern['response_count']} responses)")
-                st.caption(f"Common words: {', '.join(pattern['common_words'])}")
-                
-                # Show sample responses
-                with st.expander(f"Sample responses for {pattern['pattern_name']}", expanded=False):
-                    for i, sample in enumerate(pattern['sample_responses'], 1):
-                        st.write(f"{i}. {sample}")
-            
-            # Add new theme functionality
-            st.write("**💡 Add New Theme/Sub-theme:**")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                new_theme_type = st.selectbox("Theme Type", ["sub_theme", "major_theme"], key="new_theme_type")
-            
-            with col2:
-                if new_theme_type == "sub_theme":
-                    # Get available major themes
-                    major_theme_options = []
-                    for major in st.session_state["theme_dict"].get("major_themes", []):
-                        major_theme_options.append((major["id"], major["label"]))
-                    
-                    parent_theme = st.selectbox("Parent Major Theme", major_theme_options, key="parent_theme")
-                else:
-                    parent_theme = None
-            
-            new_theme_name = st.text_input("New Theme Name", key="new_theme_name")
-            new_theme_definition = st.text_area("Theme Definition", key="new_theme_definition")
-            
-            col3, col4 = st.columns(2)
-            with col3:
-                if st.button("➕ Add New Theme", type="secondary"):
-                    if new_theme_name and new_theme_definition:
-                        new_theme = {
-                            "type": new_theme_type,
-                            "theme_name": new_theme_name,
-                            "definition": new_theme_definition,
-                            "parent_theme_id": parent_theme[0] if parent_theme else None,
-                            "sample_responses": [pattern["sample_responses"][0] for pattern in pattern_analysis["patterns"]]
-                        }
-                        
-                        # Add to theme dictionary
-                        updated_theme_dict = add_new_theme_to_dictionary(st.session_state["theme_dict"], new_theme)
-                        st.session_state["theme_dict"] = updated_theme_dict
-                        
-                        st.success(f"✅ Added new {new_theme_type}: {new_theme_name}")
-                        
-                        # Offer to re-assign with new themes
-                        if st.button("🔄 Re-assign All Responses with New Themes", type="primary"):
-                            st.info("Re-assigning all responses with the expanded theme dictionary...")
-                            # This would trigger a re-assignment - for now just show a message
-                            st.success("Theme dictionary updated! Consider re-running the assignment process to use the new themes.")
-                        st.rerun()
-                    else:
-                        st.error("Please provide both theme name and definition")
-            
-            with col4:
-                if st.button("🤖 AI Suggest Themes", type="secondary"):
-                    st.info("🤖 AI theme suggestion feature coming soon! For now, use the pattern analysis above to manually create themes.")
-    
-    # Optional manual review mode for advanced users
-    if st.checkbox("Enable manual review mode", value=False):
-        review_mode = "Manual review"
-    else:
-        review_mode = "Automatic verification"
+    st.info(f"✅ **{len(flagged)} low-confidence responses were automatically verified and are at their best possible assignment**")
+    st.caption(f"These responses (initially below {low_thresh} confidence) were automatically re-checked during the coding process.")
 else:
-    st.success("✅ All responses have high confidence scores!")
-    review_mode = "Automatic verification"
-
-if review_mode == "Manual review":
-    st.write(f"**{len(flagged)} responses flagged for manual review (confidence < {low_thresh})**")
-    
-    if flagged:
-        # Create a simple pagination system
-        if "review_page" not in st.session_state:
-            st.session_state["review_page"] = 0
-        
-        page_size = 5
-        total_pages = (len(flagged) + page_size - 1) // page_size
-        start_idx = st.session_state["review_page"] * page_size
-        end_idx = min(start_idx + page_size, len(flagged))
-        
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col1:
-            if st.button("← Previous", disabled=st.session_state["review_page"] == 0):
-                st.session_state["review_page"] -= 1
-                st.rerun()
-        with col2:
-            st.write(f"Page {st.session_state['review_page'] + 1} of {total_pages}")
-        with col3:
-            if st.button("Next →", disabled=st.session_state["review_page"] >= total_pages - 1):
-                st.session_state["review_page"] += 1
-                st.rerun()
-        
-        # Show current batch for review
-        for i in range(start_idx, end_idx):
-            item = flagged[i]
-            idx = item["idx"]
-            original_text = ser.iloc[idx]
-            current_assignments = item.get("assignments", [])
-            
-            st.write(f"**Response {idx + 1}:** {original_text}")
-            assignments_text = [f"{a.get('theme_id', '')} (conf: {a.get('confidence', 0):.2f})" for a in current_assignments]
-            st.write(f"**Current assignments:** {assignments_text}")
-            
-            # Show rationale if available (only for low confidence items)
-            rationale = item.get("rationale", "")
-            if rationale:
-                st.write(f"**AI Rationale:** {rationale}")
-            
-            # Manual override options
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                # Show available themes for manual selection
-                theme_options = []
-                for major in st.session_state["theme_dict"].get("major_themes", []):
-                    theme_options.append((major["id"], f"{major['label']} (Major)"))
-                    for sub in major.get("subs", []):
-                        theme_options.append((sub["id"], f"{sub['label']} (Sub of {major['label']})"))
-                
-                selected_themes = st.multiselect(
-                    f"Select themes for response {idx + 1}:",
-                    options=[opt[0] for opt in theme_options],
-                    format_func=lambda x: next(opt[1] for opt in theme_options if opt[0] == x),
-                    default=[a.get("theme_id") for a in current_assignments if a.get("theme_id")],
-                    key=f"manual_review_{idx}"
-                )
-            
-            with col2:
-                if st.button(f"Update {idx + 1}", key=f"update_{idx}"):
-                    # Update the assignment
-                    new_assignments = [{"theme_id": theme_id, "confidence": 1.0} for theme_id in selected_themes]
-                    item["assignments"] = new_assignments
-                    item["rationale"] = "Manually reviewed and updated"
-                    
-                    # Update in session state
-                    by_idx = {x["idx"]: x for x in st.session_state["assigned_raw"]}
-                    by_idx[idx] = item
-                    st.session_state["assigned_raw"] = [by_idx[i] for i in sorted(by_idx.keys())]
-                    st.success(f"Updated response {idx + 1}")
-                    st.rerun()
-            
-            st.divider()
-    else:
-        st.success("No responses need manual review!")
-
-else:  # Automatic verification (already completed during workflow)
-    st.info("✅ All low-confidence responses were automatically verified during the coding process.")
+    st.success("🎉 **All responses have high confidence scores!**")
 
 
 # Theme distribution for charting, with volume weights
@@ -2684,7 +2948,11 @@ with col3:
     st.metric("Coding Rate", f"{coding_rate:.1f}%")
 
 with col4:
-    avg_confidence = coded_df["Confidence"].mean()
+    # Use same calculation as Quality Dashboard (top confidence per response)
+    if "quality_diagnosis" in st.session_state:
+        avg_confidence = st.session_state["quality_diagnosis"]["avg_confidence"]
+    else:
+        avg_confidence = coded_df["Confidence"].mean()
     st.metric("Avg Confidence", f"{avg_confidence:.2f}")
 
 # Theme distribution chart with interactive legend
@@ -2692,7 +2960,8 @@ st.write("**Theme Distribution**")
 
 # Prepare data for charting
 subtheme1_col = [col for col in coded_df.columns if "_SubTheme1" in col][0]
-major_counts = coded_df["MajorTheme1"].value_counts()
+major_theme1_col = [col for col in coded_df.columns if "_MajorTheme1" in col][0]
+major_counts = coded_df[major_theme1_col].value_counts()
 sub_counts = coded_df[subtheme1_col].value_counts()
 
 # Create dataframes
@@ -2846,97 +3115,6 @@ if pass_id_cols:
         st.write("**Percentages by Demographic Group**")
         st.dataframe(cross_tab_pct.round(1), width="stretch")
 
-# Auto-calculate optimal tiny theme threshold
-subtheme1_col = [col for col in coded_df.columns if "_SubTheme1" in col][0]
-theme_counts = coded_df[subtheme1_col].replace("", np.nan).dropna().value_counts()
-auto_tiny_threshold = auto_calculate_tiny_threshold(coded_df, theme_counts)
-
-# Show auto-calculated threshold with explanation and manual override option
-st.write("**Theme Distribution Analysis**")
-col_info1, col_info2 = st.columns([2, 1])
-with col_info1:
-    st.info(f"💡 **Smart Threshold:** Auto-calculated at **{auto_tiny_threshold}%** based on {len(coded_df):,} responses and {len(theme_counts)} themes (Research min: 3 responses + Statistical outlier detection)")
-with col_info2:
-    manual_override = st.number_input(
-        "Manual override (%)", 
-        min_value=0.0, 
-        max_value=10.0, 
-        value=auto_tiny_threshold,
-        step=0.1,
-        help="Override the auto-calculated threshold if needed"
-    )
-    use_manual = (manual_override != auto_tiny_threshold)
-
-# Use manual override if changed, otherwise use auto
-active_tiny_threshold = manual_override if use_manual else auto_tiny_threshold
-
-if use_manual:
-    st.caption(f"ℹ️ Using manual override: {manual_override}%")
-
-# Calculate dynamic thresholds
-dynamic_thresholds = calculate_dynamic_thresholds(st.session_state.get("theme_dict"), st.session_state.get("assigned_raw", []))
-
-# Display dynamic threshold recommendations
-if dynamic_thresholds["recommendations"]:
-    with st.expander("🎯 Additional Dynamic Threshold Recommendations", expanded=False):
-        for rec in dynamic_thresholds["recommendations"]:
-            st.info(f"• {rec}")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Suggested Tiny Threshold", f"{dynamic_thresholds['tiny_threshold']:.1f}%")
-        with col2:
-            st.metric("Suggested Confidence Threshold", f"{dynamic_thresholds['low_confidence_threshold']:.1f}")
-        with col3:
-            st.metric("Suggested Other Usage Threshold", f"{dynamic_thresholds['other_usage_threshold']:.1f}%")
-
-# Theme distribution analysis using active threshold
-theme_analysis = analyze_theme_distribution(coded_df, active_tiny_threshold, st.session_state.get("theme_dict"))
-
-# Display analysis results
-col1, col2, col3, col4, col5 = st.columns(5)
-with col1:
-    st.metric("Other Responses", f"{theme_analysis['other_count']:,}", f"{theme_analysis['other_percent']:.1f}%")
-with col2:
-    st.metric("Not Applicable", f"{theme_analysis['not_applicable_count']:,}", f"{theme_analysis['not_applicable_percent']:.1f}%")
-with col3:
-    st.metric("Manual Review", f"{theme_analysis['manual_review_count']:,}", f"{theme_analysis['manual_review_percent']:.1f}%")
-with col4:
-    st.metric("Single-Response Themes", f"{theme_analysis['tiny_theme_count']:,}", f"{theme_analysis['tiny_theme_percent']:.1f}%")
-with col5:
-    threshold_status = "⚠️ Exceeded" if theme_analysis['threshold_exceeded'] else "✅ Within Limit"
-    threshold_label = f"{'Manual' if use_manual else 'Auto'}: {active_tiny_threshold:.1f}%"
-    st.metric("Tiny Theme Threshold", threshold_label, threshold_status)
-
-# Show recommendations if any
-if theme_analysis['recommendations']:
-    st.write("**🔍 Analysis Recommendations:**")
-    for i, rec in enumerate(theme_analysis['recommendations'], 1):
-        st.info(f"{i}. {rec}")
-
-# Show tiny themes if they exist
-if theme_analysis['tiny_theme_names']:
-    st.write(f"**Single-Response Themes ({len(theme_analysis['tiny_theme_names'])}):**")
-    tiny_theme_text = ", ".join(theme_analysis['tiny_theme_names'][:10])
-    if len(theme_analysis['tiny_theme_names']) > 10:
-        tiny_theme_text += f" ... and {len(theme_analysis['tiny_theme_names']) - 10} more"
-    st.caption(tiny_theme_text)
-
-# Multi-coding analysis
-if allow_multicode:
-    subtheme1_col = [col for col in coded_df.columns if "_SubTheme1" in col][0]
-    subtheme2_col = [col for col in coded_df.columns if "_SubTheme2" in col][0]
-    subtheme3_col = [col for col in coded_df.columns if "_SubTheme3" in col][0]
-    
-    multi_coded = coded_df[subtheme2_col] != ""
-    st.write(f"**Multi-coding Analysis:** {multi_coded.sum()} responses ({multi_coded.mean()*100:.1f}%) have multiple codes")
-    
-    # Show multi-coded examples
-    if multi_coded.any():
-        st.write("**Examples of multi-coded responses:**")
-        text_col_name = [col for col in coded_df.columns if col not in pass_id_cols and col not in ["MajorTheme1", "MajorTheme2", "MajorTheme3"] and "_SubTheme" not in col and col != "Confidence"][0]
-        multi_examples = coded_df[multi_coded][[text_col_name, subtheme1_col, subtheme2_col, subtheme3_col]].head(10)
-        st.dataframe(multi_examples, width="stretch")
 
 # ------------------------------
 # Export
@@ -2989,10 +3167,10 @@ if "usage_assign" in locals():
     total_usage["prompt_tokens"] += usage_assign.get("prompt_tokens", 0)
     total_usage["completion_tokens"] += usage_assign.get("completion_tokens", 0)
 
-# Add usage from verification if available
-if "usage_verify" in locals():
-    total_usage["prompt_tokens"] += usage_verify.get("prompt_tokens", 0)
-    total_usage["completion_tokens"] += usage_verify.get("completion_tokens", 0)
+# Add usage from quality improvement if available
+if "usage_quality" in locals():
+    total_usage["prompt_tokens"] += usage_quality.get("prompt_tokens", 0)
+    total_usage["completion_tokens"] += usage_quality.get("completion_tokens", 0)
 
 # Update session state
 st.session_state["_usage_totals"] = total_usage
