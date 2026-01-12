@@ -1966,7 +1966,7 @@ def map_theme_id_to_major(theme_df: pd.DataFrame) -> Dict[str, str]:
 # ------------------------------
 
 st.set_page_config(
-    page_title="Express Explorer Thematic Coder", 
+    page_title="Open-End Coding",
     layout="wide",
     initial_sidebar_state="expanded",
     page_icon="📊"
@@ -1989,7 +1989,7 @@ st.markdown("""
         border-left: 4px solid #667eea;
     }
     .success-box {
-        background: #d4edda;
+        background: #427043;
         border: 1px solid #c3e6cb;
         border-radius: 8px;
         padding: 1rem;
@@ -2016,8 +2016,8 @@ st.markdown("""
 # Header
 st.markdown("""
 <div class="main-header">
-    <h1>📊 Express Explorer Thematic Coder</h1>
-    <p>Upload open‑ended survey responses, auto‑discover Major and Sub‑themes, and export professionally coded data.</p>
+    <h1>📊Open-End Coding</h1>
+    <p>Upload open‑ended survey responses, generate themes, and export coded data.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -2336,33 +2336,6 @@ if "theme_dict" not in st.session_state or "assigned_raw" not in st.session_stat
 # Show theme quality validation
 if "theme_validation" in st.session_state:
     validation = st.session_state["theme_validation"]
-    
-    # Overall quality score
-    score_color = "green" if validation["overall_score"] >= 0.8 else "orange" if validation["overall_score"] >= 0.6 else "red"
-    st.metric("🎯 Theme Quality Score", f"{validation['overall_score']:.1%}", delta=None)
-    
-    # Show issues and suggestions
-    if validation["issues"]:
-        with st.expander("⚠️ Theme Quality Issues", expanded=False):
-            for issue in validation["issues"]:
-                st.warning(f"• {issue}")
-    
-    if validation["suggestions"]:
-        with st.expander("💡 Improvement Suggestions", expanded=False):
-            for suggestion in validation["suggestions"]:
-                st.info(f"• {suggestion}")
-    
-    # Individual theme analysis
-    if validation["theme_analysis"]:
-        with st.expander("🔍 Individual Theme Analysis", expanded=False):
-            for theme_id, analysis in validation["theme_analysis"].items():
-                st.write(f"**{analysis['label']}** (Score: {analysis['score']:.1%})")
-                if analysis["issues"]:
-                    for issue in analysis["issues"]:
-                        st.caption(f"⚠️ {issue}")
-                if analysis["suggestions"]:
-                    for suggestion in analysis["suggestions"]:
-                        st.caption(f"💡 {suggestion}")
 
 # Show theme dictionary
 st.write("**Generated Theme Dictionary:**")
@@ -2400,10 +2373,6 @@ with col2:
 
 st.caption("💡 **Tip**: Use these exports to save your themes and import them later using the 'Upload existing themes' option!")
 
-# Show JSON preview
-with st.expander("🔍 Preview JSON Format"):
-    st.code(theme_json[:1000] + "..." if len(theme_json) > 1000 else theme_json, language="json")
-    st.caption("This JSON format can be directly imported using the 'Upload existing themes' option above.")
 
 # Comprehensive export (themes + coded data)
 st.write("**Complete Export (Themes + Coded Data):**")
@@ -2880,81 +2849,9 @@ if not chart_data.empty:
 else:
     st.info("No themes selected for display.")
 
-# Cross-tabulation with demographic variables - moved below chart
-if pass_id_cols:
-    st.write("**Cross-tabulation Analysis**")
-    
-    # Let user select a demographic variable for cross-tab
-    demo_col = st.selectbox("Select demographic variable for cross-tabulation", 
-                           options=pass_id_cols, 
-                           help="Choose a column to analyze theme distribution across different groups")
-    
-    if demo_col:
-        # Create cross-tab with percentages only
-        cross_tab_pct = pd.crosstab(coded_df[demo_col], coded_df["Code1"], normalize="index") * 100
-        
-        st.write("**Percentages by Demographic Group**")
-        st.dataframe(cross_tab_pct.round(1), width="stretch")
-
-# Calculate dynamic thresholds
-dynamic_thresholds = calculate_dynamic_thresholds(st.session_state.get("theme_dict"), st.session_state.get("assigned_raw", []))
-
-# Display dynamic threshold recommendations
-if dynamic_thresholds["recommendations"]:
-    with st.expander("🎯 Dynamic Threshold Recommendations", expanded=False):
-        for rec in dynamic_thresholds["recommendations"]:
-            st.info(f"• {rec}")
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Suggested Tiny Threshold", f"{dynamic_thresholds['tiny_threshold']:.1f}%")
-        with col2:
-            st.metric("Suggested Confidence Threshold", f"{dynamic_thresholds['low_confidence_threshold']:.1f}")
-        with col3:
-            st.metric("Suggested Other Usage Threshold", f"{dynamic_thresholds['other_usage_threshold']:.1f}%")
-
 # Theme distribution analysis using tiny_threshold
 st.write("**Theme Distribution Analysis**")
 theme_analysis = analyze_theme_distribution(coded_df, tiny_threshold, st.session_state.get("theme_dict"))
-
-# Display analysis results
-col1, col2, col3, col4, col5 = st.columns(5)
-with col1:
-    st.metric("Other Responses", f"{theme_analysis['other_count']:,}", f"{theme_analysis['other_percent']:.1f}%")
-with col2:
-    st.metric("Not Applicable", f"{theme_analysis['not_applicable_count']:,}", f"{theme_analysis['not_applicable_percent']:.1f}%")
-with col3:
-    st.metric("Manual Review", f"{theme_analysis['manual_review_count']:,}", f"{theme_analysis['manual_review_percent']:.1f}%")
-with col4:
-    st.metric("Single-Response Themes", f"{theme_analysis['tiny_theme_count']:,}", f"{theme_analysis['tiny_theme_percent']:.1f}%")
-with col5:
-    threshold_status = "⚠️ Exceeded" if theme_analysis['threshold_exceeded'] else "✅ Within Limit"
-    st.metric("Tiny Theme Threshold", f"{tiny_threshold:.1f}%", threshold_status)
-
-# Show recommendations if any
-if theme_analysis['recommendations']:
-    st.write("**🔍 Analysis Recommendations:**")
-    for i, rec in enumerate(theme_analysis['recommendations'], 1):
-        st.info(f"{i}. {rec}")
-
-# Show tiny themes if they exist
-if theme_analysis['tiny_theme_names']:
-    st.write(f"**Single-Response Themes ({len(theme_analysis['tiny_theme_names'])}):**")
-    tiny_theme_text = ", ".join(theme_analysis['tiny_theme_names'][:10])
-    if len(theme_analysis['tiny_theme_names']) > 10:
-        tiny_theme_text += f" ... and {len(theme_analysis['tiny_theme_names']) - 10} more"
-    st.caption(tiny_theme_text)
-
-# Multi-coding analysis
-if allow_multicode:
-    multi_coded = coded_df["Code2"] != ""
-    st.write(f"**Multi-coding Analysis:** {multi_coded.sum()} responses ({multi_coded.mean()*100:.1f}%) have multiple codes")
-    
-    # Show multi-coded examples
-    if multi_coded.any():
-        st.write("**Examples of multi-coded responses:**")
-        multi_examples = coded_df[multi_coded][["OpenEnd_Text", "Code1", "Code2", "Code3"]].head(10)
-        st.dataframe(multi_examples, width="stretch")
 
 # ------------------------------
 # Export
