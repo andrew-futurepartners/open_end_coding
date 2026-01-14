@@ -21,11 +21,17 @@ import io
 import json
 import math
 import datetime as dt
+import re
 import time
 import asyncio
 import concurrent.futures
 from typing import List, Dict, Any, Tuple
 from threading import Lock
+import threading
+import random
+from collections import deque
+
+
 
 import pandas as pd
 import numpy as np
@@ -34,17 +40,42 @@ from openai import OpenAI
 from openai import RateLimitError
 from dotenv import load_dotenv
 
+
 # ------------------------------
 # Utilities
 # ------------------------------
 
+@st.cache_resource
 def get_openai_client() -> OpenAI:
-    load_dotenv()
-    api_key = os.getenv("OPENAI_API_KEY")
+    """
+    Prefer Streamlit secrets in deployed environments, fall back to env/.env locally.
+    Cached so we don't re-create the client on every rerun.
+    """
+    api_key = None
+
+    # Prefer Streamlit secrets (Streamlit Cloud / deployed)
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        api_key = None
+
+    # Fall back to env/.env for local dev
+    if not api_key:
+        load_dotenv()
+        api_key = os.getenv("OPENAI_API_KEY")
+
     if not api_key:
         st.error("OpenAI API key not set. Add OPENAI_API_KEY to Streamlit secrets or environment.")
         st.stop()
-    return OpenAI(api_key=api_key)
+
+    # Add a sane timeout for reliability (supported by OpenAI Python 1.x)
+    return OpenAI(
+        api_key=api_key,
+        timeout=float(os.getenv("OPENAI_TIMEOUT_SECONDS", "120")),
+        max_retries=0,  # we handle retries explicitly (avoid double-retry) :contentReference[oaicite:11]{index=11}
+    )
+
+
 
 
 def fmt_cost(total_prompt_tokens: int, total_completion_tokens: int, pricing: Dict[str, Any]) -> float:
@@ -69,104 +100,222 @@ def clean_text(x: Any) -> str:
     return s
 
 
+# Best-effort redaction for obvious PII before sending text to the LLM.
+# This will NOT catch names/addresses reliably; advise users to pre-scrub if needed.
+_EMAIL_RE = re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b")
+_URL_RE = re.compile(r"\bhttps?://\S+|\bwww\.\S+", re.IGNORECASE)
+# Conservative US-centric phone matcher (reduces false positives vs ultra-generic digit patterns).
+_PHONE_RE = re.compile(r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b")
+_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+
+def redact_pii(s: str) -> str:
+    if not s:
+        return ""
+    s2 = s
+    s2 = _EMAIL_RE.sub("[EMAIL]", s2)
+    s2 = _URL_RE.sub("[URL]", s2)
+    s2 = _PHONE_RE.sub("[PHONE]", s2)
+    s2 = _SSN_RE.sub("[SSN]", s2)
+    return s2
+
+
+
 def is_empty_like(s: str) -> bool:
     if not s:
         return True
-    # Common non‑answers in many languages, minimal set, verified in model pass later
-    na_set = {"n/a", "na", "none", "no", "nothing", "-", "—", "dont know", "don't know", "idk", "prefer not to say"}
+    # Keep conservative: "no/none/nothing" can be substantive depending on the question.
+    na_set = {"n/a", "na", "-", "—", "dont know", "don't know", "idk", "prefer not to say"}
     return s.lower() in na_set
 
 
-def estimate_tokens(text: str) -> int:
-    """Rough token estimation: ~4 characters per token"""
-    return len(text) // 4
+
+def estimate_tokens(text: str, model: str = "gpt-5") -> int:
+    """
+    Best-effort token estimation.
+    - Uses tiktoken when available (more accurate)
+    - Falls back to ~4 chars/token heuristic
+    """
+    try:
+        import tiktoken  # optional dependency
+
+        try:
+            enc = tiktoken.encoding_for_model(model)
+        except Exception:
+            # Fallback encoding used by many OpenAI models
+            enc = tiktoken.get_encoding("o200k_base")
+
+        return len(enc.encode(text))
+    except Exception:
+        return max(1, len(text) // 4)
 
 
-def chunk_data(data: List[Dict[str, Any]], max_tokens: int = 400000) -> List[List[Dict[str, Any]]]:
-    """Split data into chunks that won't exceed token limits"""
+def safe_prompt_token_budget(model: str, reserve_output_tokens: int = 8_000) -> int:
+    """
+    Conservative prompt budget (tokens) for the request INPUT.
+    GPT-5 family models have 400k context and 128k max output tokens. :contentReference[oaicite:5]{index=5}
+    So max input is effectively bounded to ~272k (=400k-128k), and we keep extra safety headroom.
+    """
+    # Default conservative fallback if model is unknown
+    context_window = 128_000
+    max_output_tokens = 16_384
+
+    if model.startswith("gpt-5"):
+        context_window = 400_000
+        max_output_tokens = 128_000  # per model docs :contentReference[oaicite:6]{index=6}
+
+    max_input = max(1, context_window - max_output_tokens)
+    # Keep safety headroom for: system text, JSON schema overhead, and tool formatting
+    return max(1, int(max_input * 0.85) - reserve_output_tokens)
+
+
+def chunk_data(data: list, max_tokens: int, model: str = "gpt-5") -> list:
+    """
+    Chunk a list of items so the JSON payload stays under max_tokens.
+    Uses compact JSON encoding to reduce prompt size.
+    """
     chunks = []
     current_chunk = []
     current_tokens = 0
-    
+
     for item in data:
-        item_tokens = estimate_tokens(json.dumps(item))
-        
-        # If adding this item would exceed the limit, start a new chunk
-        if current_tokens + item_tokens > max_tokens and current_chunk:
+        item_str = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        item_tokens = estimate_tokens(item_str, model=model)
+
+        # If a single item is huge, force it into its own chunk
+        if current_chunk and (current_tokens + item_tokens > max_tokens):
             chunks.append(current_chunk)
             current_chunk = [item]
             current_tokens = item_tokens
         else:
             current_chunk.append(item)
             current_tokens += item_tokens
-    
-    # Add the last chunk if it has items
+
     if current_chunk:
         chunks.append(current_chunk)
-    
+
     return chunks
 
 
-# Rate limiting for GPT-5: 500 RPM, 500K TPM
-_request_times = []
-_token_usage = []
-_rate_limit_lock = Lock()
+# ------------------------------
+# Rate limiting (RPM + TPM)
+# ------------------------------
+DEFAULT_RPM = int(os.getenv("OPENAI_RPM", "500"))
+DEFAULT_TPM = int(os.getenv("OPENAI_TPM", "500000"))
 
-def check_rate_limits(estimated_tokens: int = 0):
-    """NUCLEAR MODE: Minimal rate limiting - let OpenAI handle the throttling"""
-    with _rate_limit_lock:
-        current_time = time.time()
-        
-        # Clean old entries (older than 1 minute)
-        cutoff_time = current_time - 60
-        global _request_times, _token_usage
-        _request_times = [t for t in _request_times if t > cutoff_time]
-        _token_usage = [(t, tokens) for t, tokens in _token_usage if t > cutoff_time]
-        
-        # NUCLEAR MODE: Only prevent hitting the absolute limits
-        # Let OpenAI's servers do the rate limiting for maximum speed
-        
-        # Only block if we're at 99% of limits
-        if len(_request_times) >= 495:  # 99% of 500 RPM
-            # Tiny sleep to prevent hitting absolute limit
-            time.sleep(0.01)  # 10ms sleep
-        
-        current_tokens = sum(tokens for _, tokens in _token_usage)
-        if current_tokens + estimated_tokens > 495000:  # 99% of 500K TPM
-            # Tiny sleep to prevent hitting absolute limit
-            time.sleep(0.01)  # 10ms sleep
-        
-        # Record this request
-        _request_times.append(current_time)
+_rate_lock = Lock()
+_req_times = deque()          # timestamps (seconds) for requests
+_tok_times = deque()          # (timestamp, tokens) for token usage
+_tok_sum = 0                  # rolling sum of tokens in last 60s
+
+
+def check_rate_limits(estimated_tokens: int = 0, rpm: int = DEFAULT_RPM, tpm: int = DEFAULT_TPM) -> None:
+    """
+    Hard-enforced rolling 60s window limiter.
+    Thread-safe, blocks until the request can be made.
+    """
+    global _tok_sum
+
+    with _rate_lock:
+        now = time.time()
+        cutoff = now - 60.0
+
+        # prune old requests
+        while _req_times and _req_times[0] < cutoff:
+            _req_times.popleft()
+
+        # prune old tokens
+        while _tok_times and _tok_times[0][0] < cutoff:
+            ts, toks = _tok_times.popleft()
+            _tok_sum -= toks
+
+        # compute required sleep
+        wait = 0.0
+
+        if len(_req_times) >= rpm:
+            wait = max(wait, (_req_times[0] + 60.0) - now)
+
+        if estimated_tokens > 0 and (_tok_sum + estimated_tokens) > tpm:
+            need_to_expire = (_tok_sum + estimated_tokens) - tpm
+            running = 0
+            for ts, toks in _tok_times:
+                running += toks
+                if running >= need_to_expire:
+                    wait = max(wait, (ts + 60.0) - now)
+                    break
+            else:
+                # extremely conservative fallback
+                wait = max(wait, 1.0)
+
+    if wait > 0:
+        # sleep outside lock so other threads can compute their waits
+        time.sleep(wait + random.uniform(0, 0.25))
+
+    with _rate_lock:
+        now = time.time()
+        _req_times.append(now)
         if estimated_tokens > 0:
-            _token_usage.append((current_time, estimated_tokens))
+            _tok_times.append((now, estimated_tokens))
+            _tok_sum += estimated_tokens
 
-def retry_with_backoff(func, max_retries: int = 3, base_delay: float = 1.0):
-    """Retry function with exponential backoff, Retry-After header support, and rate limiting"""
-    for attempt in range(max_retries):
+
+def _extract_status_code(err: Exception) -> int | None:
+    # Best-effort: openai-python exceptions often expose status_code or a response with status_code
+    for attr in ("status_code",):
+        sc = getattr(err, attr, None)
+        if isinstance(sc, int):
+            return sc
+    resp = getattr(err, "response", None)
+    sc = getattr(resp, "status_code", None)
+    return sc if isinstance(sc, int) else None
+
+
+def _extract_retry_after_seconds(err: Exception) -> float | None:
+    resp = getattr(err, "response", None)
+    headers = getattr(resp, "headers", None) or getattr(err, "headers", None) or {}
+    if not isinstance(headers, dict):
+        return None
+    ra = headers.get("retry-after") or headers.get("Retry-After")
+    if ra is None:
+        return None
+    try:
+        return float(ra)
+    except Exception:
+        return None
+
+
+def retry_with_backoff(func, max_retries: int = 6, base_delay: float = 0.5, max_delay: float = 30.0):
+    """
+    Retries transient failures with exponential backoff + jitter.
+    Keeps Streamlit calls out of worker threads.
+    """
+    transient_status = {408, 409, 425, 429, 500, 502, 503, 504}
+
+    for attempt in range(max_retries + 1):
         try:
             return func()
-        except RateLimitError as e:
-            if attempt == max_retries - 1:
-                raise e
-            
-            # Check for Retry-After header
-            retry_after = None
-            if hasattr(e, 'response') and e.response:
-                retry_after = e.response.headers.get("retry-after")
-            
-            if retry_after:
-                delay = float(retry_after)
-                st.warning(f"Rate limit hit. Retrying in {delay:.1f} seconds (Retry-After)... (attempt {attempt + 1}/{max_retries})")
-            else:
-                delay = base_delay * (2 ** attempt) * (1 + np.random.random() * 0.25)
-                st.warning(f"Rate limit hit. Retrying in {delay:.1f} seconds... (attempt {attempt + 1}/{max_retries})")
-            
-            time.sleep(min(delay, 20))
+        except KeyboardInterrupt:
+            raise
         except Exception as e:
-            # For non-rate-limit errors, don't retry
-            raise e
+            status = _extract_status_code(e)
+            is_transient = isinstance(e, RateLimitError) or (status in transient_status)
 
+            # Heuristic fallback for network/timeout-y failures
+            msg = str(e).lower()
+            if ("timeout" in msg) or ("temporarily" in msg) or ("connection" in msg):
+                is_transient = True
+
+            if (not is_transient) or (attempt >= max_retries):
+                raise
+
+            retry_after = _extract_retry_after_seconds(e)
+            if retry_after is not None:
+                delay = min(max_delay, max(0.0, retry_after))
+            else:
+                delay = min(max_delay, base_delay * (2 ** attempt))
+
+            # jitter
+            delay = delay + random.uniform(0, delay * 0.2)
+            time.sleep(delay)
 
 
 
@@ -347,9 +496,107 @@ ASSIGNMENTS_SCHEMA = {
     }
 }
 
+THEME_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "theme_dictionary",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "major_themes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "label": {"type": "string"},
+                            "definition": {"type": "string"},
+                            "approx_pct": {"type": "number", "minimum": 0, "maximum": 1},
+                            "subs": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "label": {"type": "string"},
+                                        "definition": {"type": "string"},
+                                        "approx_pct": {"type": "number", "minimum": 0, "maximum": 1},
+                                        "examples": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+                                    },
+                                    "required": ["id", "label", "definition", "approx_pct", "examples"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                        },
+                        "required": ["id", "label", "definition", "approx_pct", "subs"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["major_themes"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+}
+
+def allowed_subtheme_ids(theme_dict: Dict[str, Any]) -> List[str]:
+    """Return all valid *subtheme* IDs (leaf codes) in stable order."""
+    ids: List[str] = []
+    for major in theme_dict.get("major_themes", []):
+        for sub in (major.get("subs") or []):
+            sid = sub.get("id")
+            if sid:
+                ids.append(sid)
+    return sorted(set(ids))
+
+
+def make_assignments_schema(allowed_ids: List[str], max_codes: int) -> Dict[str, Any]:
+    """Dynamic JSON schema: constrain theme_id to enum(allowed_ids) and cap codes returned."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "assignments",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "results": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "idx": {"type": "integer"},
+                                "assignments": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "maxItems": int(max_codes),
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "theme_id": {"type": "string", "enum": allowed_ids},
+                                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                                        },
+                                        "required": ["theme_id", "confidence"],
+                                        "additionalProperties": False,
+                                    },
+                                },
+                            },
+                            "required": ["idx", "assignments"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["results"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        },
+    }
+
 # ------------------------------
 # Prompt builders
 # ------------------------------
+
 
 THEME_DISCOVERY_SYSTEM = (
     "You are a senior market research analyst. You design clear, business‑ready thematic taxonomies that provide actionable insights. Focus on the substantive content of what respondents are saying about the topic, not on survey mechanics or response quality. Use neutral, professional language. Specific themes are more valuable than generic 'Other' categories for business decision-making."
@@ -443,8 +690,8 @@ You will re‑check only low‑confidence or ambiguous assignments. If an assign
 
 If the top assignment is <{low_thresh} and a secondary theme is a materially better fit, promote the secondary and adjust confidences accordingly.
 If an assignment is clearly correct but under-confident, raise it to an appropriate level; do not leave obviously correct matches <{low_thresh}.
-If no theme is defensible after re-check, set manual_review: true and keep a single, best-effort assignment with low confidence.
-Optional note may explain changes in ≤15 words.
+If no theme is defensible after re-check, keep a single, best-effort assignment with low confidence.
+
 
 Return the same JSON shape as the assignment step, for only the provided rows. If you agree with the existing assignment, return it unchanged but you may adjust confidence.
 
@@ -457,6 +704,63 @@ Flagged rows:
 {flagged_json}
 """
 )
+
+# Question label inference schema
+QUESTION_LABEL_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "question_label",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string"}
+            },
+            "required": ["label"],
+            "additionalProperties": False
+        },
+        "strict": True
+    }
+}
+
+
+def infer_question_label(client: OpenAI, model: str, question_text: str, seed: int | None) -> str:
+    """Infer a compact question label like qAge or qGender from the question text."""
+    if not question_text:
+        return "qQuestion"
+
+    # If already tagged like [qAge], prefer that tag
+    m = re.match(r"^\s*\[([A-Za-z][A-Za-z0-9_]*)\]\s*", question_text)
+    if m:
+        tag = m.group(1)
+        return f"q{tag[1:]}" if tag.lower().startswith("q") else f"q{tag}"
+
+    system = "You assign concise variable-style question labels."
+    user = (
+        "Given this survey question text, propose a short label in the format qXxx. "
+        "Use camel case, no spaces, only letters/numbers. Keep it under 12 chars if possible.\n\n"
+        f"Question: {question_text}\n\n"
+        "Return JSON: {\"label\":\"qXxx\"}"
+    )
+
+    data, _ = retry_with_backoff(
+        lambda: oai_json_completion(
+            client,
+            model,
+            system,
+            user,
+            seed,
+            response_schema=QUESTION_LABEL_SCHEMA,
+            reasoning_effort="minimal",
+            verbosity="low",
+            reserve_output_tokens=256,
+        )
+    )
+
+    label = (data.get("label") if isinstance(data, dict) else None) or "qQuestion"
+    label = re.sub(r"[^A-Za-z0-9]", "", label)
+    if not label.lower().startswith("q"):
+        label = f"q{label}"
+    return label or "qQuestion"
 
 # ------------------------------
 # OpenAI helpers
@@ -474,44 +778,153 @@ class OAICounter:
         self.completion += usage.get("completion_tokens", 0)
 
 
-def oai_json_completion(client: OpenAI, model: str, system: str, user: str, seed: int | None, response_schema: Dict[str, Any] = None) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Call Chat Completions expecting a JSON object or array in content. Returns (parsed_json, usage)."""
-    params = dict(
-        model=model,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-    )
-    
-    # Use schema if provided, otherwise fall back to json_object
-    if response_schema:
-        params["response_format"] = response_schema
-    else:
-        params["response_format"] = {"type": "json_object"}
-    
-    # GPT-5 doesn't support temperature parameter, uses default temperature=1
-    if model != "gpt-5":
-        params["temperature"] = 0
-    
-    # Seed is optional. If unsupported, OpenAI will ignore it. We keep it here for determinism where available.
-    if seed is not None:
-        params["seed"] = int(seed)
 
-    resp = client.chat.completions.create(**params)
-    content = resp.choices[0].message.content
+def _schema_to_responses_text_format(response_schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Your schemas are currently in Chat Completions format:
+      {"type":"json_schema","json_schema":{name,schema,strict}}
+    Responses API expects:
+      {"type":"json_schema","name":...,"schema":...,"strict":...}
+    """
+    if not response_schema:
+        return {"type": "json_object"}
+
+    if response_schema.get("type") == "json_schema" and "json_schema" in response_schema:
+        js = response_schema["json_schema"]
+        return {
+            "type": "json_schema",
+            "name": js.get("name", "schema"),
+            "schema": js.get("schema", {}),
+            "strict": bool(js.get("strict", True)),
+        }
+
+    # Already in the flattened shape
+    return response_schema
+
+
+def _should_use_responses_api(client: OpenAI, model: str) -> bool:
+    # Prefer Responses for GPT-5 family (better support for reasoning/verbosity & migration path) :contentReference[oaicite:15]{index=15}
+    return hasattr(client, "responses") and model.startswith("gpt-5")
+
+
+def oai_json_completion(
+    client: OpenAI,
+    model: str,
+    system: str,
+    user: str,
+    seed: int = 42,
+    response_schema: Dict[str, Any] | None = None,
+    reasoning_effort: str | None = "minimal",   # GPT-5: minimal/medium/high; GPT-5.1: none/low/...
+    verbosity: str | None = "low",
+    reserve_output_tokens: int = 8_000,
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """
+    Single entry point for JSON outputs.
+    - Centralized rate limiting
+    - Responses API for GPT-5 family when available
+    - Chat Completions fallback
+    """
+    # Token estimate for limiter (compact schema to reduce overhead)
+    schema_str = ""
+    if response_schema:
+        schema_str = json.dumps(response_schema, ensure_ascii=False, separators=(",", ":"))
+
+    est = (
+        estimate_tokens(system, model=model)
+        + estimate_tokens(user, model=model)
+        + (estimate_tokens(schema_str, model=model) if schema_str else 0)
+        + 200  # small fixed overhead
+    )
+    check_rate_limits(est)
+
+    # Keep prompts safely under max input budget
+    budget = safe_prompt_token_budget(model, reserve_output_tokens=reserve_output_tokens)
+    if est > budget:
+        raise ValueError(
+            f"Prompt too large for safe budget (estimated {est} tokens > budget {budget}). "
+            f"Chunk the inputs more aggressively."
+        )
+
+    # --- Responses API path (preferred for GPT-5 family) ---
+    if _should_use_responses_api(client, model):
+        text_format = _schema_to_responses_text_format(response_schema) if response_schema else {"type": "json_object"}
+
+        # GPT-5.1 docs: temperature/top_p only supported when reasoning.effort == "none" :contentReference[oaicite:16]{index=16}
+        # So we avoid temperature entirely for GPT-5 family and steer via reasoning + verbosity.
+        response_params = {
+            "model": model,
+            "input": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "reasoning": {"effort": reasoning_effort} if reasoning_effort else None,
+            "text": {"format": text_format, "verbosity": verbosity} if verbosity else {"format": text_format},
+            "seed": seed,
+            "max_output_tokens": reserve_output_tokens,
+        }
+
+        # Some SDK versions don't support seed in Responses API
+        try:
+            resp = client.responses.create(**response_params)
+        except TypeError as e:
+            if "seed" in response_params:
+                response_params.pop("seed", None)
+                resp = client.responses.create(**response_params)
+            else:
+                raise e
+
+        raw = getattr(resp, "output_text", None)
+        if not raw:
+            # ultra-defensive fallback if SDK changes structure
+            raw = json.dumps(resp.model_dump(), ensure_ascii=False)
+
+        try:
+            parsed = json.loads(raw)
+        except Exception as e:
+            raise ValueError(f"Failed to parse model JSON output. Raw output starts with: {raw[:200]}") from e
+
+        usage = getattr(resp, "usage", None)
+        usage_dict = {
+            "prompt_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+        }
+        return parsed, usage_dict
+
+    # --- Chat Completions fallback ---
+    request_params: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "seed": seed,
+    }
+
+    if response_schema is not None:
+        request_params["response_format"] = response_schema
+    else:
+        request_params["response_format"] = {"type": "json_object"}
+
+    # IMPORTANT: GPT-5.1 guide warns temperature/top_p may error unless reasoning.effort == "none"
+    # Since we don't pass reasoning_effort through chat completions here, we keep temperature unset.
+    request_params["max_completion_tokens"] = reserve_output_tokens
+
+    response = client.chat.completions.create(**request_params)
+    content = response.choices[0].message.content
+
+    if not content:
+        raise ValueError("Empty response content from OpenAI API")
+
     try:
         data = json.loads(content)
-    except Exception:
-        # Try to coerce array as object if needed
-        if content.strip().startswith("["):
-            data = json.loads(content)
-        else:
-            raise
-    usage = {
-        "prompt_tokens": getattr(resp.usage, "prompt_tokens", 0) or 0,
-        "completion_tokens": getattr(resp.usage, "completion_tokens", 0) or 0,
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON response: {content[:200]}") from e
+
+    usage_dict = {
+        "prompt_tokens": response.usage.prompt_tokens,
+        "completion_tokens": response.usage.completion_tokens,
     }
-    return data, usage
-
-
+    return data, usage_dict
 
 
 # ------------------------------
@@ -536,12 +949,8 @@ def build_theme_frame(client: OpenAI, model: str, texts: List[str], freq: List[i
         if not t or is_empty_like(t):
             non_answer_count += w  # Count frequency of non-answers
             continue
-        
-        # Filter out very short responses that are likely non-substantive
-        if len(t.strip()) < 10:
-            short_response_count += w
-            continue
-            
+
+        # Keep short-but-substantive responses (e.g., "Price"); empties are already filtered above.
         filtered_data.append({"text": t, "weight": int(w)})
     
     # Show filtering statistics
@@ -565,10 +974,23 @@ def build_theme_frame(client: OpenAI, model: str, texts: List[str], freq: List[i
     if total_tokens <= 400000:  # GPT-5 safe token limit
         payload = json.dumps(filtered_data)
         user = THEME_DISCOVERY_USER + "\n\nWeighted responses (JSON array):\n" + payload
-        
+
         def make_request():
-            return oai_json_completion(client, model, THEME_DISCOVERY_SYSTEM, user, seed)
-        
+            return oai_json_completion(
+                client,
+                model,
+                THEME_SYSTEM,
+                THEME_USER_TEMPLATE.format(
+                    question_context=question_context,
+                    data_json=json.dumps(filtered_data, ensure_ascii=False, separators=(",", ":"))
+                ),
+                seed,
+                response_schema=THEME_SCHEMA,
+                reasoning_effort="medium",  # theme discovery benefits from more reasoning
+                verbosity="low",
+                reserve_output_tokens=12_000
+            )
+
         data, usage = retry_with_backoff(make_request)
         return data, usage
     
@@ -595,10 +1017,23 @@ def build_theme_frame(client: OpenAI, model: str, texts: List[str], freq: List[i
                 enhanced_prompt += "Consider these priorities when creating your thematic framework.\n"
             
             user = enhanced_prompt + "\n\nWeighted responses (JSON array):\n" + payload
-            
+
             def make_chunk_request():
-                return oai_json_completion(client, model, THEME_DISCOVERY_SYSTEM, user, seed)
-            
+                return oai_json_completion(
+                    client,
+                    model,
+                    THEME_SYSTEM,
+                    THEME_USER_TEMPLATE.format(
+                        question_context=question_context,
+                        data_json=json.dumps(chunk, ensure_ascii=False, separators=(",", ":"))
+                    ),
+                    seed,
+                    response_schema=THEME_SCHEMA,
+                    reasoning_effort="medium",
+                    verbosity="low",
+                    reserve_output_tokens=12_000
+                )
+
             return retry_with_backoff(make_chunk_request)
         
         # Use parallel processing for theme generation
@@ -950,8 +1385,91 @@ def validate_theme_quality(theme_dict: Dict[str, Any], question_context: Dict = 
     
     if len(validation_results["issues"]) == 0:
         validation_results["suggestions"].append("Theme quality looks good! Consider fine-tuning based on assignment results.")
-    
+
     return validation_results
+
+
+def ensure_nonanswer_theme(theme_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure a Non-answer major theme exists with predictable leaf subthemes.
+    Prevents brittle fallbacks and makes non-answer handling auditable.
+    """
+    majors = theme_dict.get("major_themes", []) or []
+
+    def norm(x: str) -> str:
+        return re.sub(r"[^a-z]+", "", (x or "").lower())
+
+    # Locate existing Non-answer major if present
+    nonanswer_major = None
+    for m in majors:
+        if norm(m.get("label", "")) == "nonanswer":
+            nonanswer_major = m
+            break
+
+    # Create it if missing
+    if not nonanswer_major:
+        nonanswer_major = {
+            "id": "T999",
+            "label": "Non-answer",
+            "definition": "Responses that do not provide a substantive answer to the question.",
+            "approx_pct": 0.0,
+            "subs": [],
+        }
+        majors.append(nonanswer_major)
+        theme_dict["major_themes"] = majors
+
+    # Ensure the Non-answer major has a stable id
+    if not nonanswer_major.get("id"):
+        nonanswer_major["id"] = "T999"
+
+    major_id = nonanswer_major.get("id") or "T999"
+    nonanswer_major.setdefault("subs", [])
+    subs = nonanswer_major.get("subs", []) or []
+
+    # Canonical Non-answer subthemes (match by normalized label)
+    canonical = [
+        ("refusal", "Refusal", "Explicit refusal to answer."),
+        ("dontknow", "Don't know", "Respondent indicates they don't know / can't recall."),
+        ("nonsense", "Nonsense", "Incoherent or meaningless text."),
+        ("spam", "Spam", "Promotional/irrelevant content, links, or spam."),
+        ("notapplicable", "Not applicable", "Response indicates question does not apply / blank / n/a."),
+    ]
+
+    existing = {norm(s.get("label", "")): s for s in subs}
+
+    # Track used numeric suffixes for ids like <major_id>.<n>
+    used_nums = set()
+    for s in subs:
+        sid = str(s.get("id", ""))
+        m = re.match(rf"^{re.escape(major_id)}\.(\d+)$", sid)
+        if m:
+            used_nums.add(int(m.group(1)))
+
+    next_n = 1
+    for key, label, definition in canonical:
+        if key in existing:
+            # Ensure required fields exist
+            existing[key].setdefault("definition", definition)
+            existing[key].setdefault("examples", [])
+            existing[key].setdefault("approx_pct", 0.0)
+            continue
+
+        while next_n in used_nums:
+            next_n += 1
+
+        subs.append({
+            "id": f"{major_id}.{next_n}",
+            "label": label,
+            "definition": definition,
+            "approx_pct": 0.0,
+            "examples": [],
+        })
+        used_nums.add(next_n)
+        next_n += 1
+
+    nonanswer_major["subs"] = subs
+    return theme_dict
+
 
 def calibrate_confidence(confidence: float, response_text: str, theme_id: str) -> float:
     """Calibrate confidence based on response characteristics and theme fit"""
@@ -1028,12 +1546,12 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
             continue
         
         # Filter out very short responses that are likely non-substantive
-        if len(t.strip()) < 10:
-            short_response_count += w
-            continue
-            
-        filtered_data.append({"text": t, "weight": int(w)})
-    
+        # Keep short-but-substantive responses (e.g., "Price"); only filter true non-answers above.
+        filtered_data.append({
+            "text": t,
+            "weight": int(w)
+        })
+
     # Show filtering statistics
     total_responses = sum(freq)
     filtered_responses = sum(item["weight"] for item in filtered_data)
@@ -1045,10 +1563,14 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
     
     # Sort by weight
     filtered_data.sort(key=lambda x: x["weight"], reverse=True)
-    
-    # Check if we need to chunk the filtered data
-    total_tokens = estimate_tokens(json.dumps(filtered_data))
-    if total_tokens <= 400000:  # GPT-5 safe token limit
+
+    safe_limit = safe_prompt_token_budget(model, reserve_output_tokens=12_000)
+    total_tokens = estimate_tokens(
+        json.dumps(filtered_data, ensure_ascii=False, separators=(",", ":")),
+        model=model
+    )
+
+    if total_tokens <= safe_limit:
         status_text.text("🎯 Generating themes from all responses...")
         progress_bar.progress(50)
         
@@ -1073,10 +1595,10 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
     
     else:
         # Process in chunks and merge results
-        status_text.text(f"🚀 Large dataset detected ({total_tokens:,} tokens). Processing in chunks...")
-        progress_bar.progress(30)
-        
-        chunks = chunk_data(filtered_data, max_tokens=350000)  # GPT-5 conservative limit
+        st.warning("Large dataset detected. Processing in chunks for stability...")
+        chunk_budget = int(safe_limit * 0.80)  # leave room for system + question_context
+        chunks = chunk_data(filtered_data, max_tokens=chunk_budget, model=model)
+
         all_themes = []
         total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
         
@@ -1099,7 +1621,7 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
             return retry_with_backoff(make_chunk_request)
         
         # Use parallel processing for theme generation
-        max_workers = min(5, len(chunks))  # Parallel theme generation
+        max_workers = min(3, len(chunks))  # Parallel theme generation
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_chunk = {executor.submit(process_theme_chunk, chunk): i for i, chunk in enumerate(chunks)}
@@ -1134,110 +1656,132 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
         return result, total_usage
 
 
+
 def merge_theme_chunks(theme_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Merge theme chunks and deduplicate similar themes with proper hierarchy enforcement"""
+    """Merge theme chunks and deduplicate similar themes with proper hierarchy enforcement.
+
+    Chunked theme discovery often produces colliding IDs (e.g., each chunk starts at T1/T1.1).
+    This merge is label-based and then renumbers IDs deterministically to avoid overwrites and
+    improve rerun consistency.
+    """
     if not theme_chunks:
         return []
-    
-    # Step 1: Collect all labels at both major and sub levels
+
+    def norm_label(x: str) -> str:
+        return re.sub(r"\s+", " ", (x or "").strip().lower())
+
+    def norm_alpha(x: str) -> str:
+        return re.sub(r"[^a-z]+", "", (x or "").lower())
+
+    # Step 1: Detect labels that appear as both major and sub across chunks (hierarchy conflicts)
     all_major_labels = set()
     all_sub_labels = set()
-    
+
     for theme in theme_chunks:
-        major_label = theme.get("label", "").strip()
+        major_label = theme.get("label", "")
         if major_label:
-            all_major_labels.add(major_label.lower().strip())
-        
-        for sub in theme.get("subs", []):
-            sub_label = sub.get("label", "").strip()
+            all_major_labels.add(norm_label(major_label))
+        for sub in theme.get("subs", []) or []:
+            sub_label = sub.get("label", "")
             if sub_label:
-                all_sub_labels.add(sub_label.lower().strip())
-    
-    # Step 2: Identify hierarchy conflicts (same label at both major and sub level)
-    conflicting_labels = all_major_labels.intersection(all_sub_labels)
-    
+                all_sub_labels.add(norm_label(sub_label))
+
+    conflicting_labels = {lbl for lbl in (all_major_labels & all_sub_labels) if lbl}
     if conflicting_labels:
-        st.warning(f"🔧 Resolving hierarchy conflicts: {len(conflicting_labels)} themes appear at both major and sub levels")
-    
-    # Step 3: Merge themes with conflict resolution
-    merged = {}
-    
+        st.warning(
+            f"⚠️ Found {len(conflicting_labels)} themes that appear as both major and sub themes across chunks. "
+            "These will be kept as major themes and removed from sub-themes."
+        )
+
+    # Step 2: Merge majors by normalized label (NOT by id)
+    merged_by_label: Dict[str, Dict[str, Any]] = {}
+
     for theme in theme_chunks:
-        theme_id = theme.get("id", "")
-        theme_label = theme.get("label", "").strip()
-        
-        if not theme_label:  # Skip empty labels
+        major_label = (theme.get("label") or "").strip()
+        if not major_label:
             continue
-            
-        # Normalize label for comparison
-        normalized_label = theme_label.lower().strip()
-        
-        # Check if we already have a major theme with this exact label
-        existing_key = None
-        for key, existing_theme in merged.items():
-            existing_label = existing_theme.get("label", "").lower().strip()
-            if existing_label == normalized_label:
-                existing_key = key
-                break
-        
-        if existing_key:
-            # Merge with existing major theme
-            existing_theme = merged[existing_key]
-            
-            # Merge sub-themes, but skip any that conflict with major theme labels
-            existing_sub_labels = {sub.get("label", "").lower().strip() for sub in existing_theme.get("subs", [])}
-            
-            for sub in theme.get("subs", []):
-                sub_label = sub.get("label", "").strip()
-                sub_label_norm = sub_label.lower().strip()
-                
-                # Skip if this sub-theme label conflicts with any major theme label
-                if sub_label_norm in conflicting_labels:
-                    continue
-                    
-                if sub_label and sub_label_norm not in existing_sub_labels:
-                    existing_theme.setdefault("subs", []).append(sub)
-                    existing_sub_labels.add(sub_label_norm)
-                    
-        else:
-            # Add new major theme with clean structure
-            clean_theme = {
-                "id": theme_id,
-                "label": theme_label,
+
+        major_key = norm_label(major_label)
+        merged_major = merged_by_label.get(major_key)
+        if not merged_major:
+            merged_major = {
+                "id": theme.get("id", ""),
+                "label": major_label,
                 "definition": theme.get("definition", ""),
-                "subs": []
+                "approx_pct": theme.get("approx_pct", 0.0),
+                "subs": [],
             }
-            
-            # Add sub-themes, ensuring no duplicates and no conflicts with major themes
-            sub_labels_seen = set()
-            for sub in theme.get("subs", []):
-                sub_label = sub.get("label", "").strip()
-                sub_label_norm = sub_label.lower().strip()
-                
-                # Skip if this sub-theme label conflicts with any major theme label
-                if sub_label_norm in conflicting_labels:
-                    continue
-                
-                if sub_label and sub_label_norm not in sub_labels_seen:
-                    clean_theme["subs"].append(sub)
-                    sub_labels_seen.add(sub_label_norm)
-            
-            merged[theme_id] = clean_theme
-    
-    # Step 4: Final validation - ensure no sub-theme has the same label as any major theme
-    for theme in merged.values():
-        major_label_norm = theme.get("label", "").lower().strip()
+            merged_by_label[major_key] = merged_major
+
+        # Merge subthemes (unique by normalized label)
+        existing_sub_keys = {norm_label(s.get("label", "")): s for s in merged_major.get("subs", []) if s.get("label")}
+
+        for sub in theme.get("subs", []) or []:
+            sub_label = (sub.get("label") or "").strip()
+            if not sub_label:
+                continue
+
+            sub_key = norm_label(sub_label)
+
+            # Remove hierarchy conflicts: if it is also a major label, keep it only at major level
+            if sub_key in conflicting_labels:
+                continue
+
+            if sub_key in existing_sub_keys:
+                continue
+
+            merged_major["subs"].append({
+                "id": sub.get("id", ""),
+                "label": sub_label,
+                "definition": sub.get("definition", ""),
+                "approx_pct": sub.get("approx_pct", 0.0),
+                "examples": sub.get("examples", []),
+            })
+            existing_sub_keys[sub_key] = sub
+
+    merged_themes = list(merged_by_label.values())
+
+    # Step 3: Ensure no sub theme has the same label as its parent major theme
+    for theme in merged_themes:
+        major_label_norm = norm_label(theme.get("label", ""))
         theme["subs"] = [
             sub for sub in theme.get("subs", [])
-            if sub.get("label", "").lower().strip() != major_label_norm
+            if norm_label(sub.get("label", "")) != major_label_norm
         ]
-    
-    merged_themes = list(merged.values())
-    
+
+    # Step 4: Deterministic ordering + renumbering to avoid chunk ID collisions
+    nonanswer = []
+    normal = []
+    for theme in merged_themes:
+        if norm_alpha(theme.get("label", "")) == "nonanswer":
+            nonanswer.append(theme)
+        else:
+            normal.append(theme)
+
+    normal.sort(key=lambda t: norm_label(t.get("label", "")))
+    nonanswer.sort(key=lambda t: norm_label(t.get("label", "")))
+    ordered = normal + nonanswer
+
+    next_major_num = 1
+    for theme in ordered:
+        if norm_alpha(theme.get("label", "")) == "nonanswer":
+            major_id = "T999"
+        else:
+            major_id = f"T{next_major_num}"
+            next_major_num += 1
+
+        theme["id"] = major_id
+
+        subs = theme.get("subs", []) or []
+        subs.sort(key=lambda s: norm_label(s.get("label", "")))
+        for j, sub in enumerate(subs, start=1):
+            sub["id"] = f"{major_id}.{j}"
+        theme["subs"] = subs
+
     if conflicting_labels:
-        st.success(f"✅ Resolved {len(conflicting_labels)} hierarchy conflicts - themes now have proper major/sub structure")
-    
-    return merged_themes
+        st.success(f"✅ Resolved {len(conflicting_labels)} hierarchy conflicts and renumbered IDs for consistency.")
+
+    return ordered
 
 
 def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: List[Dict[str, Any]], max_codes: int, seed: int | None) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
@@ -1274,7 +1818,7 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
             # Assign to non-answer theme for filtered responses
             non_answer_assignments.append({
                 "idx": row["idx"],
-                "assignments": [{"theme_id": non_answer_theme_id or "T1.1", "confidence": 1.0}]
+                "assignments": [{"theme_id": (non_answer_theme_id or "T99.1"), "confidence": 1.0}]
             })
             continue
         filtered_rows.append(row)
@@ -1311,6 +1855,9 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
         # Single request for unique responses
         st.info(f"🚀 Using single request mode for {len(unique_rows_for_ai)} unique responses ({total_tokens:,} tokens)")
         theme_json = json.dumps(slim_theme_for_assignment(theme_dict))
+        allowed_ids = allowed_subtheme_ids(theme_dict)
+        schema = make_assignments_schema(allowed_ids, max_codes if allow_multicode else 1)
+
         responses_json = json.dumps(unique_rows_for_ai, separators=(",", ":"))
         
         # Debug: Show theme structure
@@ -1321,8 +1868,8 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
         user = ASSIGNMENT_USER_TEMPLATE.format(max_codes=max_codes, theme_json=theme_json, responses_json=responses_json)
         
         def make_request():
-            return oai_json_completion(client, model, ASSIGNMENT_SYSTEM, user, seed, ASSIGNMENTS_SCHEMA)
-        
+            return oai_json_completion(client, model, ASSIGNMENT_SYSTEM, user, seed, schema)
+
         data, usage = retry_with_backoff(make_request)
         # Data expected as object with results array
         if isinstance(data, dict) and "results" in data:
@@ -1366,210 +1913,234 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
         return final_assignments, total_usage
 
 
-def assign_codes_with_progress(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: List[Dict[str, Any]], max_codes: int, seed: int | None, progress_bar, status_text) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Assign themes to responses - PROCESS ALL RESPONSES WITH DUPLICATE CONSISTENCY"""
-    
+def assign_codes_with_progress(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: List[Dict[str, Any]],
+                               max_codes: int, seed: int | None, progress_bar, status_text) -> Tuple[
+    List[Dict[str, Any]], Dict[str, int]]:
+    """Assign themes to responses with progress tracking.
+
+    Improvements vs v1:
+    - Ensures Non-answer leaf codes exist and uses simple heuristics to route empty/NA/don't-know/refusal correctly.
+    - Uses token-budget batching (vs fixed chunk_size=10) to reduce repeated codebook overhead and API calls.
+    - Propagates a lightweight rationale for auto/fallback paths to aid audit/review.
+    """
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
     status_text.text("Processing responses...")
     progress_bar.progress(5)
-    
-    # Find a non-answer theme ID from the theme dictionary for empty responses
-    non_answer_theme_id = None
-    for major in theme_dict.get("major_themes", []):
-        if "non-answer" in major.get("label", "").lower():
-            subs = major.get("subs", [])
-            if subs:
-                non_answer_theme_id = subs[0].get("id")
-                break
-    
-    # Fallback if no non-answer theme found
-    if not non_answer_theme_id:
-        for major in theme_dict.get("major_themes", []):
-            subs = major.get("subs", [])
-            if subs:
-                non_answer_theme_id = subs[0].get("id")
-                break
-    
-    # Step 1: Identify unique responses and their indices for consistency
-    text_to_indices = {}
+
+    # Always ensure predictable Non-answer subthemes exist (even for uploaded codebooks)
+    theme_dict = ensure_nonanswer_theme(theme_dict)
+
+    def _norm(x: str) -> str:
+        return re.sub(r"[^a-z]+", "", (x or "").lower())
+
+    nonanswer_major = next(
+        (m for m in theme_dict.get("major_themes", []) or [] if _norm(m.get("label", "")) == "nonanswer"), None)
+    nonanswer_sub_ids = {_norm(s.get("label", "")): s.get("id") for s in
+                         (nonanswer_major.get("subs", []) if nonanswer_major else [])}
+
+    default_nonanswer_id = (
+            nonanswer_sub_ids.get("notapplicable")
+            or nonanswer_sub_ids.get("dontknow")
+            or next(iter(nonanswer_sub_ids.values()), None)
+    )
+
+    def _pick_nonanswer_id(text: str) -> str:
+        t = (text or "").strip().lower()
+        if not t:
+            key = "notapplicable"
+        elif any(p in t for p in ["prefer not", "rather not", "no comment", "refuse", "pass"]):
+            key = "refusal"
+        elif any(p in t for p in ["don't know", "dont know", "idk", "not sure", "unsure", "unknown"]):
+            key = "dontknow"
+        elif any(p in t for p in ["spam", "http", "www."]):
+            key = "spam"
+        else:
+            key = "notapplicable"
+
+        return nonanswer_sub_ids.get(key) or default_nonanswer_id or "T999.5"
+
+    # Step 1: Build mapping of unique responses to their indices (to maintain consistency for duplicates)
+    status_text.text("Deduplicating responses...")
+    progress_bar.progress(10)
+
+    text_to_indices: Dict[str, List[int]] = {}
     for row in rows:
-        text = row["text"]
+        text = row.get("text", "").strip()
+        idx = row.get("idx")
+        if idx is None:
+            continue
+
         if text not in text_to_indices:
             text_to_indices[text] = []
-        text_to_indices[text].append(row["idx"])
-    
+        text_to_indices[text].append(idx)
+
     unique_texts = list(text_to_indices.keys())
-    
-    # Step 2: Process unique responses and store assignments
-    text_to_assignment = {}
-    total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-    
-    # Optimize processing with efficient chunking
-    chunk_size = 10
-    unique_count = len(unique_texts)
-    total_chunks = math.ceil(unique_count / chunk_size)
-    
-    # Prepare all chunks for parallel processing
-    all_chunks = []
-    for i in range(0, unique_count, chunk_size):
-        chunk_texts = unique_texts[i:i + chunk_size]
-        all_chunks.append((i, chunk_texts))
-    
-    def process_single_chunk(chunk_data):
-        """Process a single chunk of unique texts"""
-        chunk_start_idx, chunk_texts = chunk_data
-        chunk_assignments = {}
-        chunk_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-        
-        # Prepare chunk for processing
-        responses_for_ai = []
-        
-        for j, text in enumerate(chunk_texts):
-            if not text or is_empty_like(text) or len(text.strip()) < 3:
-                # Handle empty responses directly
+
+    # Prepare a compact theme representation once (reused across batches)
+    theme_json = json.dumps(slim_theme_for_assignment(theme_dict), separators=(",", ":"))
+    theme_tokens = estimate_tokens(theme_json)
+
+    # Token-budget batching to reduce API calls (conservative default ~128k context models)
+    max_prompt_tokens = 120000
+    overhead_tokens = 1200  # system/user instructions, schema wrapper, etc.
+    batch_budget = max(20000, max_prompt_tokens - theme_tokens - overhead_tokens)
+
+    all_chunks: List[List[str]] = []
+    current_chunk: List[str] = []
+    current_tokens = 0
+
+    for text in unique_texts:
+        # Rough per-item cost: payload framing + the text itself
+        item_tokens = estimate_tokens(text) + 20
+        if current_chunk and (current_tokens + item_tokens) > batch_budget:
+            all_chunks.append(current_chunk)
+            current_chunk = []
+            current_tokens = 0
+        current_chunk.append(text)
+        current_tokens += item_tokens
+
+    if current_chunk:
+        all_chunks.append(current_chunk)
+
+    # Step 2: Process chunks in parallel
+    status_text.text(f"Processing {len(unique_texts)} unique responses in {len(all_chunks)} batches...")
+    progress_bar.progress(20)
+
+    _allowed_ids = allowed_subtheme_ids(theme_dict)
+    schema = make_assignments_schema(_allowed_ids, max_codes=max_codes)
+
+    # fallback used only if an LLM call fails or returns incomplete results
+    fallback_theme_id = default_nonanswer_id or (_allowed_ids[0] if _allowed_ids else "T999.5")
+
+    # Store assignments by text
+    text_to_assignment: Dict[str, Dict[str, Any]] = {}
+
+    def process_single_chunk(chunk_texts: List[str], chunk_idx: int) -> Dict[str, Dict[str, Any]]:
+        chunk_assignments: Dict[str, Dict[str, Any]] = {}
+
+        # Handle empty/non-answer responses deterministically without an LLM call
+        responses_for_ai: List[Dict[str, Any]] = []
+        for text in chunk_texts:
+            if not text or is_empty_like(text):
                 chunk_assignments[text] = {
-                    "assignments": [{"theme_id": non_answer_theme_id or "T1.1", "confidence": 1.0}]
+                    "assignments": [{"theme_id": _pick_nonanswer_id(text), "confidence": 1.0}],
+                    "rationale": "Auto: non-answer/blank",
                 }
             else:
-                # Add to AI processing list with sequential index for this chunk
-                responses_for_ai.append({
-                    "idx": j,
-                    "text": text
-                })
-        
-        # Process non-empty responses with AI
-        if responses_for_ai:
-            theme_json = json.dumps(slim_theme_for_assignment(theme_dict))
-            responses_json = json.dumps(responses_for_ai)
-            user = ASSIGNMENT_USER_TEMPLATE.format(max_codes=max_codes, theme_json=theme_json, responses_json=responses_json)
-            
-            def make_request():
-                # Estimate tokens for rate limiting
-                estimated_tokens = estimate_tokens(responses_json)
-                check_rate_limits(estimated_tokens)
-                return oai_json_completion(client, model, ASSIGNMENT_SYSTEM, user, seed, ASSIGNMENTS_SCHEMA)
-            
-            try:
-                data, usage = retry_with_backoff(make_request)
-                
-                # Accumulate usage
-                chunk_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                chunk_usage["completion_tokens"] += usage.get("completion_tokens", 0)
-                
-                # Parse response
-                if isinstance(data, dict) and "results" in data:
-                    ai_assignments = data["results"]
-                else:
-                    ai_assignments = data if isinstance(data, list) else []
-                
-                # Map AI assignments back to texts with confidence calibration
-                for assignment in ai_assignments:
-                    ai_idx = assignment.get("idx")
-                    if ai_idx is not None and ai_idx < len(responses_for_ai):
-                        text = responses_for_ai[ai_idx]["text"]
-                        
-                        # Apply confidence calibration to each assignment
-                        calibrated_assignments = []
-                        for assign in assignment.get("assignments", []):
-                            original_confidence = assign.get("confidence", 0.5)
-                            theme_id = assign.get("theme_id", "")
-                            calibrated_confidence = calibrate_confidence(original_confidence, text, theme_id)
-                            
-                            calibrated_assignments.append({
-                                "theme_id": theme_id,
-                                "confidence": calibrated_confidence
-                            })
-                        
-                        chunk_assignments[text] = {
-                            "assignments": calibrated_assignments
-                        }
-                
-                # Handle any responses that didn't get assignments
-                for response in responses_for_ai:
-                    text = response["text"]
-                    if text not in chunk_assignments:
-                        chunk_assignments[text] = {
-                            "assignments": [{"theme_id": non_answer_theme_id or "T1.1", "confidence": 0.5}]
-                        }
-                
-            except Exception as e:
-                # Fallback: assign first theme to all responses in this chunk
-                for response in responses_for_ai:
-                    text = response["text"]
-                    chunk_assignments[text] = {
-                        "assignments": [{"theme_id": non_answer_theme_id or "T1.1", "confidence": 0.5}]
+                responses_for_ai.append({"idx": len(responses_for_ai), "text": text})
+
+        # If everything in this batch was non-answer, we're done
+        if not responses_for_ai:
+            return chunk_assignments
+
+        responses_json = json.dumps(responses_for_ai, separators=(",", ":"))
+        user_prompt = ASSIGNMENT_USER_TEMPLATE.format(theme_json=theme_json, responses_json=responses_json,
+                                                      max_codes=max_codes)
+
+        try:
+            data, usage = retry_with_backoff(
+                lambda: oai_json_completion(client, model, ASSIGNMENT_SYSTEM, user_prompt, seed, response_schema=schema)
+            )
+
+            total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+            total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+
+            ai_assignments = data.get("results") if isinstance(data, dict) else data
+            if not isinstance(ai_assignments, list):
+                ai_assignments = []
+
+            for assignment in ai_assignments:
+                ai_idx = assignment.get("idx")
+                if ai_idx is None or ai_idx < 0 or ai_idx >= len(responses_for_ai):
+                    continue
+
+                original_text = responses_for_ai[ai_idx]["text"]
+                assignments = assignment.get("assignments", [])
+
+                if assignments:
+                    # Calibrate confidence for better quality
+                    for a in assignments:
+                        if "confidence" in a:
+                            a["confidence"] = calibrate_confidence(a["confidence"], original_text,
+                                                                   a.get("theme_id", ""))
+
+                    chunk_assignments[original_text] = {"assignments": assignments}
+
+            # Fill missing items (should be rare) with a low-confidence fallback for manual review
+            for r in responses_for_ai:
+                t = r["text"]
+                if t not in chunk_assignments:
+                    chunk_assignments[t] = {
+                        "assignments": [{"theme_id": fallback_theme_id, "confidence": 0.0}],
+                        "rationale": "Fallback: missing LLM result",
                     }
-        
-        return chunk_assignments, chunk_usage
-    
-    # Use optimized parallel processing
-    max_workers = min(50, len(all_chunks))
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all chunks for processing
-        future_to_chunk = {executor.submit(process_single_chunk, chunk_data): i for i, chunk_data in enumerate(all_chunks)}
-        
+
+        except Exception as e:
+            # On error, keep output shape stable but force manual review via 0-confidence
+            for r in responses_for_ai:
+                t = r["text"]
+                chunk_assignments[t] = {
+                    "assignments": [{"theme_id": fallback_theme_id, "confidence": 0.0}],
+                    "rationale": f"Fallback: LLM error ({type(e).__name__})",
+                }
+
+        return chunk_assignments
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(all_chunks))) as executor:
+        future_to_chunk = {executor.submit(process_single_chunk, chunk, i): i for i, chunk in enumerate(all_chunks)}
+
         completed = 0
-        # Collect results as they complete
         for future in concurrent.futures.as_completed(future_to_chunk):
+            chunk_idx = future_to_chunk[future]
             try:
-                chunk_assignments, chunk_usage = future.result()
-                
-                # Merge chunk assignments into main dictionary
+                chunk_assignments = future.result()
                 text_to_assignment.update(chunk_assignments)
-                
-                # Accumulate usage
-                total_usage["prompt_tokens"] += chunk_usage.get("prompt_tokens", 0)
-                total_usage["completion_tokens"] += chunk_usage.get("completion_tokens", 0)
-                
                 completed += 1
-                progress = 5 + (completed * 90 // len(all_chunks))
-                progress_bar.progress(progress)
-                status_text.text(f"Processing chunk {completed}/{len(all_chunks)}")
-                
+
+                progress_pct = 20 + int((completed / len(all_chunks)) * 70)
+                progress_bar.progress(progress_pct)
+                status_text.text(f"Completed batch {completed}/{len(all_chunks)}")
+
             except Exception as e:
-                st.error(f"Error processing chunk: {str(e)}")
-                # Continue with other chunks
-    
+                st.error(f"Error processing batch {chunk_idx}: {str(e)}")
+
     # Step 3: Expand assignments to all original responses (maintaining duplicates)
-    all_assignments = []
-    
+    all_assignments: List[Dict[str, Any]] = []
+
     for text, indices in text_to_indices.items():
-        if text in text_to_assignment:
-            assignment_template = text_to_assignment[text]
-            # Apply the same assignment to all instances of this text
+        assignment_template = text_to_assignment.get(text)
+        if assignment_template:
             for idx in indices:
                 all_assignments.append({
                     "idx": idx,
-                    "assignments": assignment_template["assignments"]
+                    "assignments": assignment_template.get("assignments", []),
+                    "rationale": assignment_template.get("rationale", ""),
                 })
         else:
-            # Fallback for any missed texts
-            st.warning(f"Missing assignment for text: {text[:50]}...")
             for idx in indices:
                 all_assignments.append({
                     "idx": idx,
-                    "assignments": [{"theme_id": non_answer_theme_id or "T1.1", "confidence": 0.5}]
+                    "assignments": [{"theme_id": fallback_theme_id, "confidence": 0.0}],
+                    "rationale": "Fallback: missing assignment",
                 })
-    
+
     # Step 4: Ensure we have assignments for ALL response indices
     assigned_indices = {a["idx"] for a in all_assignments}
     total_rows = len(rows)
-    
+
     for i in range(total_rows):
         if i not in assigned_indices:
-            # Missing assignment - add fallback
             all_assignments.append({
                 "idx": i,
-                "assignments": [{"theme_id": non_answer_theme_id or "T1.1", "confidence": 0.5}]
+                "assignments": [{"theme_id": fallback_theme_id, "confidence": 0.0}],
+                "rationale": "Fallback: missing response index",
             })
-            st.warning(f"Added fallback assignment for missing response index {i}")
-    
-    # Sort by index
+
     all_assignments.sort(key=lambda x: x["idx"])
-    
+
     progress_bar.progress(100)
     status_text.text(f"Completed processing {len(all_assignments)} assignments")
-    
+
     return all_assignments, total_usage
 
 
@@ -1739,15 +2310,26 @@ def expand_deduplicated_results(unique_assignments: List[Dict[str, Any]], respon
     expanded_assignments.sort(key=lambda x: x["idx"])
     return expanded_assignments
 
-
-def verify_low_confidence(client: OpenAI, model: str, theme_dict: Dict[str, Any], flagged: List[Dict[str, Any]], low_thresh: float, seed: int | None) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+def verify_low_confidence(
+            client: OpenAI,
+            model: str,
+            theme_dict: Dict[str, Any],
+            flagged: List[Dict[str, Any]],
+            low_thresh: float,
+            max_codes: int,
+            seed: int | None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Verify low confidence assignments"""
     if not flagged:
         return [], {"prompt_tokens": 0, "completion_tokens": 0}
-    
+
     chunk_size = 5
     total_chunks = math.ceil(len(flagged) / chunk_size)
-    
+
+    # Constrain verification outputs to valid theme IDs
+    _allowed_ids = allowed_subtheme_ids(theme_dict)
+    schema = make_assignments_schema(_allowed_ids, max_codes=max_codes)
+
     # Prepare all chunks for parallel processing
     all_chunks = []
     for i in range(0, len(flagged), chunk_size):
@@ -1764,12 +2346,12 @@ def verify_low_confidence(client: OpenAI, model: str, theme_dict: Dict[str, Any]
             # Minimal rate limiting
             estimated_tokens = estimate_tokens(flagged_json)
             check_rate_limits(estimated_tokens)
-            return oai_json_completion(client, model, VERIFY_SYSTEM, user, seed, ASSIGNMENTS_SCHEMA)
-        
+            return oai_json_completion(client, model, VERIFY_SYSTEM, user, seed, schema)
+
         return retry_with_backoff(make_request)
     
     # Use parallel processing for verification
-    max_workers = min(20, len(all_chunks))
+    max_workers = min(5, len(all_chunks))
     
     all_verified = []
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
@@ -1814,8 +2396,8 @@ def analyze_theme_distribution(coded_df: pd.DataFrame, tiny_threshold: float, th
     total_responses = len(coded_df)
     
     # Count responses in different categories
-    other_themes = coded_df[coded_df["Code1"].str.contains("Other", case=False, na=False)]
-    not_applicable = coded_df[coded_df["Code1"].str.contains("Not applicable", case=False, na=False)]
+    other_themes = coded_df[coded_df[f"{question_label}_MinorTheme1"].str.contains("Other", case=False, na=False)]
+    not_applicable = coded_df[coded_df[f"{question_label}_MinorTheme1"].str.contains("Not applicable", case=False, na=False)]
     manual_review_needed = coded_df.get("ManualReview", pd.Series([False] * len(coded_df), dtype=bool))
     
     other_count = len(other_themes)
@@ -1827,7 +2409,7 @@ def analyze_theme_distribution(coded_df: pd.DataFrame, tiny_threshold: float, th
     manual_review_percent = (manual_review_count / total_responses * 100) if total_responses > 0 else 0
     
     # Identify themes with very low counts (potential candidates for "Other")
-    theme_counts = coded_df["Code1"].value_counts()
+    theme_counts = coded_df[f"{question_label}_MinorTheme1"].value_counts()
     tiny_themes = theme_counts[theme_counts == 1]  # Single-response themes
     tiny_theme_count = len(tiny_themes)
     tiny_theme_percent = (tiny_theme_count / total_responses * 100) if total_responses > 0 else 0
@@ -1900,7 +2482,7 @@ def analyze_coverage_accuracy(coded_df: pd.DataFrame, theme_dict: Dict[str, Any]
                 theme_estimates[sub.get("label", "")] = sub.get("approx_pct", 0.0)
     
     # Compare with actual counts
-    actual_counts = coded_df["Code1"].value_counts()
+    actual_counts = coded_df[f"{question_label}_MinorTheme1"].value_counts()
     
     for theme_label, estimated_pct in theme_estimates.items():
         actual_count = actual_counts.get(theme_label, 0)
@@ -2029,8 +2611,10 @@ with st.sidebar:
     st.caption("🎯 **Theme Generation**: GPT-5 (highest quality)")
     st.caption("🎯 **Assignment**: GPT-5 (highest accuracy)")
     st.caption("💡 GPT-5: 500K TPM, 500 RPM - optimized for cost efficiency")
-    st.caption("🔒 Deterministic mode enabled (same input → same output)")
+    st.caption("🔒 Reproducibility is best-effort (seed + backend changes can still vary outputs)")
+    redact_pii_enabled = True
     allow_multicode = st.toggle("Multi‑coding", value=True)
+
     max_codes = 3
     single_or_multi = "Multi" if allow_multicode else "Single"
 
@@ -2038,11 +2622,6 @@ with st.sidebar:
     tiny_threshold = st.slider("Tiny theme threshold, percent", 0.0, 10.0, 1.0, 0.5, 
                              help="Warns when too many single-response themes exist - suggests consolidation into 'Other' categories")
 
-
-    st.divider()
-    st.subheader("Theme count")
-    auto_theme = st.toggle("Auto decide theme count", value=True)
-    theme_min, theme_max = st.slider("Preferred range", min_value=3, max_value=20, value=(6, 12))
 
 uploaded = st.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx"])
 
@@ -2072,22 +2651,39 @@ df.columns = [str(c).strip() for c in df.columns]
 # Ask for question column
 text_col = st.selectbox("Select the open‑end column", options=df.columns.tolist())
 
+# Reset downstream results if the uploaded file or selected column changed
+_input_sig = (uploaded.name, getattr(uploaded, "size", None), text_col)
+if st.session_state.get("_input_sig") != _input_sig:
+    for k in ("assigned_raw", "theme_validation", "_usage_totals", "review_page"):
+        st.session_state.pop(k, None)
+    st.session_state["_input_sig"] = _input_sig
+
 # Optional ID passthrough
 id_cols_guess = [c for c in df.columns if c.lower() in {"id", "respondent_id", "record id", "record_id", "transaction id", "transaction_id", "uuid"}]
 pass_id_cols = st.multiselect("ID columns to carry through", options=df.columns.tolist(), default=id_cols_guess)
 
-question_text = st.text_input("Question context (optional, improves theme quality)", value="")
 
 # Prepare series
 ser = df[text_col].map(clean_text)
+ser_ai = ser.map(redact_pii) if redact_pii_enabled else ser
 
-# Build unique set with frequency weights but preserve order for output mapping
-value_counts = ser.value_counts(dropna=False)
+# Build unique set with frequency weights (AI-safe text) but preserve order for output mapping
+value_counts = ser_ai.value_counts(dropna=False)
 unique_texts = value_counts.index.tolist()
 unique_freqs = value_counts.values.tolist()
 
 # Initialize OpenAI client
 client = get_openai_client()
+
+# Use the selected column header as question context
+question_text = text_col
+
+# Infer a compact question label (qAge, qGender, etc.)
+label_key = f"question_label::{text_col}"
+if st.session_state.get(label_key) is None:
+    with st.spinner("Inferring question label..."):
+        st.session_state[label_key] = infer_question_label(client, model, question_text, seed)
+question_label = st.session_state[label_key]
 
 st.divider()
 st.subheader("Theme discovery")
@@ -2101,8 +2697,9 @@ with col2:
 
 # Theme upload functionality
 if theme_source == "Upload existing themes":
-    uploaded_theme_file = st.file_uploader("Upload theme dictionary (JSON or XLSX)", type=["json", "xlsx"], key="theme_upload")
-    
+    uploaded_theme_file = st.file_uploader("Upload theme dictionary (JSON or XLSX)", type=["json", "xlsx"],
+                                           key="theme_upload")
+
     if uploaded_theme_file is not None:
         try:
             if uploaded_theme_file.name.lower().endswith('.json'):
@@ -2112,7 +2709,7 @@ if theme_source == "Upload existing themes":
                 # Convert XLSX to theme dictionary format
                 theme_dict = {"major_themes": []}
                 current_major = None
-                
+
                 for _, row in theme_df_upload.iterrows():
                     if row.get("Level") == "Major":
                         current_major = {
@@ -2127,12 +2724,17 @@ if theme_source == "Upload existing themes":
                             "id": row.get("ThemeID", ""),
                             "label": row.get("Label", ""),
                             "definition": row.get("ShortDefinition", ""),
-                            "examples": row.get("ExampleQuotes", "").split("; ") if pd.notna(row.get("ExampleQuotes")) else []
+                            "examples": row.get("ExampleQuotes", "").split("; ") if pd.notna(
+                                row.get("ExampleQuotes")) else []
                         }
                         current_major["subs"].append(sub_theme)
-                
-                st.session_state["theme_dict"] = theme_dict
-                st.success("Theme dictionary uploaded successfully!")
+
+            theme_dict = ensure_nonanswer_theme(theme_dict)
+            st.session_state["theme_dict"] = theme_dict
+            # Clear any prior assignments tied to a different codebook
+            st.session_state.pop("assigned_raw", None)
+            st.session_state.pop("theme_validation", None)
+            st.success("Theme dictionary uploaded successfully!")
 
         except Exception as e:
             st.error(f"Error loading theme file: {str(e)}")
@@ -2142,9 +2744,32 @@ if theme_source == "Upload existing themes":
             theme_df = flatten_theme_dict(st.session_state["theme_dict"])
             st.dataframe(theme_df, width="stretch")
 
+            if st.button("Apply uploaded themes", type="primary"):
+                # Assign themes with progress
+                apply_progress = st.progress(0)
+                apply_status = st.empty()
+
+                question_context = detect_question_type(question_text) if question_text else {"type": "general",
+                                                                                              "focus": "General analysis",
+                                                                                              "priority_themes": []}
+                st.session_state["theme_validation"] = validate_theme_quality(st.session_state["theme_dict"],
+                                                                              question_context)
+
+                rows_payload = [
+                    {"idx": int(i), "text": t}
+                    for i, t in enumerate(ser_ai.fillna("").astype(str).tolist())
+                ]
+
+                assigned, usage_assign = assign_codes_with_progress(
+                    client, model, st.session_state["theme_dict"], rows_payload,
+                    max_codes if allow_multicode else 1, seed, apply_progress, apply_status
+                )
+                st.session_state["assigned_raw"] = assigned
+                st.success("✅ Themes applied to responses. Scroll down to review and export.")
+
         if st.button("Clear uploaded themes"):
-            if "theme_dict" in st.session_state:
-                del st.session_state["theme_dict"]
+            for k in ("theme_dict", "assigned_raw", "theme_validation"):
+                st.session_state.pop(k, None)
             st.rerun()
 
 # Theme generation section
@@ -2164,7 +2789,7 @@ if theme_source == "Generate new themes":
     # Pre-filter the same way as in build_theme_frame
     filtered_for_estimation = [
         {"text": t, "weight": int(w)} for t, w in zip(unique_texts, unique_freqs)
-        if t and not is_empty_like(t) and len(t.strip()) >= 10
+        if t and not is_empty_like(t)
     ]
     estimated_prompt_tokens = estimate_tokens(json.dumps(filtered_for_estimation))
     estimated_completion_tokens = 2000  # Rough estimate for theme generation
@@ -2237,6 +2862,7 @@ if theme_source == "Generate new themes":
                     st.caption(f"**Priority Themes**: {', '.join(question_context['priority_themes'])}")
             
             theme_dict, usage_theme = build_theme_frame_with_progress(client, model, unique_texts, unique_freqs, seed, theme_progress, theme_status, question_context)
+            theme_dict = ensure_nonanswer_theme(theme_dict)
             st.session_state["theme_dict"] = theme_dict
             
             # Validate theme quality
@@ -2268,7 +2894,7 @@ if theme_source == "Generate new themes":
             
             rows_payload = [
                 {"idx": int(i), "text": t}
-                for i, t in enumerate(ser.fillna("").astype(str).tolist())
+                for i, t in enumerate(ser_ai.fillna("").astype(str).tolist())
             ]
 
             assigned, usage_assign = assign_codes_with_progress(client, model, theme_dict, rows_payload, max_codes if allow_multicode else 1, seed, assign_progress, assign_status)
@@ -2387,6 +3013,7 @@ with pd.ExcelWriter(comprehensive_buf, engine="xlsxwriter") as writer:
         assign_map = {x["idx"]: x for x in st.session_state["assigned_raw"]}
         major_map = map_theme_id_to_major(theme_df)
         label_map = {r["ThemeID"]: r["Label"] for _, r in theme_df.iterrows()}
+        theme_levels = {r["ThemeID"]: r["Level"] for _, r in theme_df.iterrows()}
         
         # Create a sample of coded data (first 100 rows for export)
         sample_coded_rows = []
@@ -2396,19 +3023,23 @@ with pd.ExcelWriter(comprehensive_buf, engine="xlsxwriter") as writer:
             if assigns:
                 primary_theme_id = assigns[0].get("theme_id", "")
                 primary_major = major_map.get(primary_theme_id, "")
-                primary_sub = primary_theme_id if primary_theme_id and theme_df.loc[theme_df["ThemeID"] == primary_theme_id, "Level"].tolist()[0] == "Sub" else ""
+                primary_sub = primary_theme_id if theme_levels.get(primary_theme_id) == "Sub" else ""
                 
                 sample_coded_rows.append({
                     "Response_Index": i,
+                    "Question": text_col,
+                    "QuestionLabel": question_label,
                     "MajorTheme": label_map.get(primary_major, ""),
                     "SubTheme": label_map.get(primary_theme_id, "") if primary_sub else "",
-                    "Confidence": assigns[0].get("confidence", 0.0),
-                    "ThemeID": primary_theme_id
                 })
         
         if sample_coded_rows:
             sample_coded_df = pd.DataFrame(sample_coded_rows)
             sample_coded_df.to_excel(writer, sheet_name="Sample Coded Data", index=False)
+
+    # Add question mapping sheet
+    question_map_df = pd.DataFrame([{"QuestionLabel": question_label, "QuestionText": text_col}])
+    question_map_df.to_excel(writer, sheet_name="Question Map", index=False)
 
 st.download_button(
     "📦 Download Complete Package",
@@ -2425,6 +3056,7 @@ assign_map = {x["idx"]: x for x in st.session_state["assigned_raw"]}
 major_map = map_theme_id_to_major(theme_df)
 label_map = {r["ThemeID"]: r["Label"] for _, r in theme_df.iterrows()}
 parent_map = {r["ThemeID"]: r["ParentThemeID"] for _, r in theme_df.iterrows()}
+theme_levels = {r["ThemeID"]: r["Level"] for _, r in theme_df.iterrows()}
 
 coded_rows = []
 for i in range(len(df)):
@@ -2435,33 +3067,38 @@ for i in range(len(df)):
 
     codes = [a.get("theme_id") for a in assigns]
     confs = [float(a.get("confidence", 0.0)) for a in assigns]
-    # Map each sub-theme to its corresponding major theme label (aligned with Code1/2/3)
-    major_ids_aligned = [parent_map.get(code_id, code_id) for code_id in codes]
+    # Map each sub-theme to its corresponding major theme label (aligned with codes)
+    major_ids_aligned = [(parent_map.get(code_id) or code_id) for code_id in codes]
     major_labels_aligned = [label_map.get(mid, "") for mid in major_ids_aligned]
 
     # Determine primary theme for single code view
     primary_theme_id = codes[0] if codes else ""
     primary_major = major_map.get(primary_theme_id, "")
-    primary_sub = primary_theme_id if primary_theme_id and theme_df.loc[theme_df["ThemeID"] == primary_theme_id, "Level"].tolist()[0] == "Sub" else ""
+    primary_sub = primary_theme_id if theme_levels.get(primary_theme_id) == "Sub" else ""
 
-    # Only include rationale if confidence is low (below threshold)
-    avg_confidence = float(np.mean(confs)) if confs else 0.0
-    rationale = item.get("rationale", "") if avg_confidence < low_thresh else ""
+    code_labels = [label_map.get(code_id, "") for code_id in codes if code_id]
+    codes_str = "; ".join([c for c in code_labels if c])
+
+    top_confidence = float(max(confs)) if confs else 0.0
 
     row = {
-        "OpenEnd_Text": ser.iloc[i],
-        "MajorTheme": label_map.get(primary_major, ""),
-        "SubTheme": label_map.get(primary_theme_id, "") if primary_sub else "",
-        "MajorTheme1": major_labels_aligned[0] if len(major_labels_aligned) > 0 else "",
-        "MajorTheme2": major_labels_aligned[1] if len(major_labels_aligned) > 1 else "",
-        "MajorTheme3": major_labels_aligned[2] if len(major_labels_aligned) > 2 else "",
-        "IsMultiCoded": allow_multicode,
-        "Confidence": avg_confidence,
-        "Rationale": rationale,
-        "Code1": label_map.get(codes[0], "") if len(codes) > 0 else "",
-        "Code2": label_map.get(codes[1], "") if len(codes) > 1 else "",
-        "Code3": label_map.get(codes[2], "") if len(codes) > 2 else "",
+        "RowIndex": i,
+        f"{question_label}_OE": ser.iloc[i],
+        f"{question_label}_MajorTheme1": major_labels_aligned[0] if len(major_labels_aligned) > 0 else "",
+        f"{question_label}_MajorTheme2": major_labels_aligned[1] if len(major_labels_aligned) > 1 else "",
+        f"{question_label}_MajorTheme3": major_labels_aligned[2] if len(major_labels_aligned) > 2 else "",
+        f"{question_label}_MajorTheme1_confidence": confs[0] if len(confs) > 0 else np.nan,
+        f"{question_label}_MajorTheme2_confidence": confs[1] if len(confs) > 1 else np.nan,
+        f"{question_label}_MajorTheme3_confidence": confs[2] if len(confs) > 2 else np.nan,
+        f"{question_label}_MinorTheme1": code_labels[0] if len(code_labels) > 0 else "",
+        f"{question_label}_MinorTheme2": code_labels[1] if len(code_labels) > 1 else "",
+        f"{question_label}_MinorTheme3": code_labels[2] if len(code_labels) > 2 else "",
+        f"{question_label}_MinorTheme1_confidence": confs[0] if len(confs) > 0 else np.nan,
+        f"{question_label}_MinorTheme2_confidence": confs[1] if len(confs) > 1 else np.nan,
+        f"{question_label}_MinorTheme3_confidence": confs[2] if len(confs) > 2 else np.nan,
+        "IsMultiCoded": (len(codes) > 1),
     }
+
     # Carry through IDs
     for c in pass_id_cols:
         row[c] = df.loc[i, c]
@@ -2471,7 +3108,23 @@ coded_df = pd.DataFrame(coded_rows)
 
 # Order columns
 id_before = pass_id_cols.copy()
-base_cols = ["OpenEnd_Text", "MajorTheme", "SubTheme", "MajorTheme1", "MajorTheme2", "MajorTheme3", "IsMultiCoded", "Confidence", "Rationale", "Code1", "Code2", "Code3"]
+base_cols = [
+    "RowIndex",
+    f"{question_label}_OE",
+    f"{question_label}_MajorTheme1",
+    f"{question_label}_MajorTheme2",
+    f"{question_label}_MajorTheme3",
+    f"{question_label}_MajorTheme1_confidence",
+    f"{question_label}_MajorTheme2_confidence",
+    f"{question_label}_MajorTheme3_confidence",
+    f"{question_label}_MinorTheme1",
+    f"{question_label}_MinorTheme2",
+    f"{question_label}_MinorTheme3",
+    f"{question_label}_MinorTheme1_confidence",
+    f"{question_label}_MinorTheme2_confidence",
+    f"{question_label}_MinorTheme3_confidence",
+    "IsMultiCoded",
+]
 ordered_cols = id_before + base_cols
 coded_df = coded_df[ordered_cols]
 
@@ -2490,7 +3143,10 @@ for item in st.session_state["assigned_raw"]:
     confs = [a.get("confidence", 0.0) for a in item.get("assignments", [])]
     top_conf = max(confs) if confs else 0.0
     if top_conf < low:
-        flagged.append(item)
+        idx = item.get("idx")
+        item_for_review = dict(item)
+        item_for_review["text"] = ser_ai.iloc[idx] if isinstance(idx, int) and 0 <= idx < len(ser_ai) else ""
+        flagged.append(item_for_review)
 
 # Review options
 if flagged:
@@ -2630,14 +3286,14 @@ if review_mode == "Manual review":
             
             with col2:
                 if st.button(f"Update {idx + 1}", key=f"update_{idx}"):
-                    # Update the assignment
                     new_assignments = [{"theme_id": theme_id, "confidence": 1.0} for theme_id in selected_themes]
-                    item["assignments"] = new_assignments
-                    item["rationale"] = "Manually reviewed and updated"
-                    
-                    # Update in session state
+
+                    # Update in session state (avoid persisting review-only fields like "text")
                     by_idx = {x["idx"]: x for x in st.session_state["assigned_raw"]}
-                    by_idx[idx] = item
+                    updated_item = by_idx.get(idx, {"idx": idx})
+                    updated_item["assignments"] = new_assignments
+                    updated_item["rationale"] = "Manually reviewed and updated"
+                    by_idx[idx] = updated_item
                     st.session_state["assigned_raw"] = [by_idx[i] for i in sorted(by_idx.keys())]
                     st.success(f"Updated response {idx + 1}")
                     st.rerun()
@@ -2650,8 +3306,16 @@ else:  # Automatic verification
     if flagged:
         if st.button(f"Re‑check {len(flagged)} low‑confidence assignments", type="primary"):
             with st.spinner("Re-checking low confidence assignments..."):
-                verified, usage_verify = verify_low_confidence(client, model, st.session_state["theme_dict"], flagged, low_thresh=low, seed=seed)
-                
+                verified, usage_verify = verify_low_confidence(
+                    client,
+                    model,
+                    st.session_state["theme_dict"],
+                    flagged,
+                    low_thresh=low,
+                    max_codes=(max_codes if allow_multicode else 1),
+                    seed=seed,
+                )
+
                 # Replace items by idx - ensure clean structure
                 by_idx = {x["idx"]: x for x in st.session_state["assigned_raw"]}
                 for v in verified:
@@ -2672,8 +3336,8 @@ else:  # Automatic verification
 st.divider()
 st.subheader("Theme distribution")
 
-# Compute support counts using primary Code1 as assignment for counting
-count_series = coded_df["Code1"].replace("", np.nan).dropna()
+# Compute support counts using primary MinorTheme1 as assignment for counting
+count_series = coded_df[f"{question_label}_MinorTheme1"].replace("", np.nan).dropna()
 counts = count_series.value_counts().rename_axis("Theme").reset_index(name="Count")
 
 # Attach Major label for grouping
@@ -2697,7 +3361,7 @@ with col1:
     st.metric("Total Responses", f"{total_responses:,}")
 
 with col2:
-    coded_responses = len(coded_df[coded_df["Code1"] != ""])
+    coded_responses = len(coded_df[coded_df[f"{question_label}_MinorTheme1"] != ""])
     st.metric("Coded Responses", f"{coded_responses:,}")
 
 with col3:
@@ -2705,15 +3369,15 @@ with col3:
     st.metric("Coding Rate", f"{coding_rate:.1f}%")
 
 with col4:
-    avg_confidence = coded_df["Confidence"].mean()
+    avg_confidence = coded_df[f"{question_label}_MinorTheme1_confidence"].mean()
     st.metric("Avg Confidence", f"{avg_confidence:.2f}")
 
 # Theme distribution chart with interactive legend
 st.write("**Theme Distribution**")
 
 # Prepare data for charting
-major_counts = coded_df["MajorTheme"].value_counts()
-sub_counts = coded_df["Code1"].value_counts()
+major_counts = coded_df[f"{question_label}_MajorTheme1"].value_counts()
+sub_counts = coded_df[f"{question_label}_MinorTheme1"].value_counts()
 
 # Create dataframes
 major_df = pd.DataFrame({
@@ -2880,6 +3544,8 @@ buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
     coded_df.to_excel(writer, sheet_name="Coded Data", index=False)
     theme_export.to_excel(writer, sheet_name="Theme Dictionary", index=False)
+    question_map_df = pd.DataFrame([{"QuestionLabel": question_label, "QuestionText": text_col}])
+    question_map_df.to_excel(writer, sheet_name="Question Map", index=False)
 
 st.download_button("Download XLSX", data=buf.getvalue(), file_name=file_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
