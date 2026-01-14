@@ -2464,6 +2464,157 @@ def analyze_theme_distribution(coded_df: pd.DataFrame, tiny_threshold: float, th
     return analysis
 
 
+def auto_merge_tiny_subthemes(
+    theme_dict: Dict[str, Any],
+    assigned_raw: List[Dict[str, Any]],
+    tiny_threshold_pct: float,
+    other_usage_threshold_pct: float = 15.0,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
+    """Merge tiny sub-themes into an 'Other' bucket per major theme."""
+    if not theme_dict or not assigned_raw:
+        return theme_dict, assigned_raw, {"merged_count": 0, "other_exceeded": False, "other_share_by_major": {}}
+
+    def norm_alpha(x: str) -> str:
+        return re.sub(r"[^a-z]+", "", (x or "").lower())
+
+    majors = theme_dict.get("major_themes", []) or []
+    sub_to_major: Dict[str, str] = {}
+    sub_label: Dict[str, str] = {}
+    for m in majors:
+        for s in m.get("subs", []) or []:
+            sid = s.get("id")
+            if sid:
+                sub_to_major[sid] = m.get("id")
+                sub_label[sid] = s.get("label", "")
+
+    # Count primary assignments
+    sub_counts: Dict[str, int] = {}
+    major_counts: Dict[str, int] = {}
+    for item in assigned_raw:
+        assigns = item.get("assignments", [])
+        if not assigns:
+            continue
+        assigns = sorted(assigns, key=lambda a: a.get("confidence", 0.0), reverse=True)
+        top = assigns[0]
+        tid = top.get("theme_id")
+        if not tid:
+            continue
+        mid = sub_to_major.get(tid) or tid
+        sub_counts[tid] = sub_counts.get(tid, 0) + 1
+        major_counts[mid] = major_counts.get(mid, 0) + 1
+
+    tiny_ids: set[str] = set()
+    tiny_to_other: Dict[str, str] = {}
+    merged_count = 0
+
+    for m in majors:
+        if norm_alpha(m.get("label", "")) == "nonanswer":
+            continue
+        mid = m.get("id")
+        total = major_counts.get(mid, 0)
+        if total <= 0:
+            continue
+
+        subs = m.get("subs", []) or []
+        other_sub = next((s for s in subs if "other" in (s.get("label", "") or "").lower()), None)
+        if not other_sub:
+            # Create an "Other" sub-theme
+            used_nums = set()
+            for s in subs:
+                sid = str(s.get("id", ""))
+                mm = re.match(rf"^{re.escape(mid)}\.(\d+)$", sid)
+                if mm:
+                    used_nums.add(int(mm.group(1)))
+            next_n = 1
+            while next_n in used_nums:
+                next_n += 1
+            other_sub = {
+                "id": f"{mid}.{next_n}",
+                "label": "Other",
+                "definition": "Miscellaneous responses that do not fit other sub-themes.",
+                "approx_pct": 0.0,
+                "examples": [],
+            }
+            subs.append(other_sub)
+
+        other_id = other_sub.get("id")
+
+        # Determine tiny sub-themes within this major
+        for s in list(subs):
+            sid = s.get("id")
+            if not sid or sid == other_id:
+                continue
+            if "other" in (s.get("label", "") or "").lower():
+                continue
+            pct = (sub_counts.get(sid, 0) / total) * 100
+            if pct < tiny_threshold_pct:
+                tiny_ids.add(sid)
+                tiny_to_other[sid] = other_id
+
+        if tiny_ids:
+            # Remove tiny sub-themes from the dictionary
+            m["subs"] = [s for s in subs if s.get("id") not in tiny_ids or s.get("id") == other_id]
+
+    # Update assignments: swap tiny IDs to Other
+    updated_assignments: List[Dict[str, Any]] = []
+    for item in assigned_raw:
+        assigns = item.get("assignments", [])
+        if not assigns:
+            updated_assignments.append(item)
+            continue
+        new_assigns = []
+        for a in assigns:
+            tid = a.get("theme_id")
+            if tid in tiny_to_other:
+                a = dict(a)
+                a["theme_id"] = tiny_to_other[tid]
+            new_assigns.append(a)
+        # Deduplicate by theme_id keeping max confidence
+        by_id: Dict[str, float] = {}
+        for a in new_assigns:
+            tid = a.get("theme_id")
+            if not tid:
+                continue
+            conf = float(a.get("confidence", 0.0))
+            by_id[tid] = max(conf, by_id.get(tid, 0.0))
+        deduped = [{"theme_id": k, "confidence": v} for k, v in by_id.items()]
+        deduped.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
+        updated_item = dict(item)
+        updated_item["assignments"] = deduped
+        updated_assignments.append(updated_item)
+
+    merged_count = len(tiny_to_other)
+
+    # Compute "Other" share by major after merge
+    other_share_by_major: Dict[str, float] = {}
+    other_exceeded = False
+    for m in majors:
+        if norm_alpha(m.get("label", "")) == "nonanswer":
+            continue
+        mid = m.get("id")
+        total = major_counts.get(mid, 0)
+        if total <= 0:
+            continue
+        other_sub = next((s for s in (m.get("subs") or []) if "other" in (s.get("label", "") or "").lower()), None)
+        if not other_sub:
+            continue
+        other_id = other_sub.get("id")
+        other_count = sub_counts.get(other_id, 0)
+        share = (other_count / total) * 100
+        other_share_by_major[mid] = share
+        if share > other_usage_threshold_pct:
+            other_exceeded = True
+
+    report = {
+        "merged_count": merged_count,
+        "other_exceeded": other_exceeded,
+        "other_share_by_major": other_share_by_major,
+        "tiny_threshold_pct": tiny_threshold_pct,
+        "other_usage_threshold_pct": other_usage_threshold_pct,
+    }
+    return theme_dict, updated_assignments, report
+
+
 def analyze_coverage_accuracy(coded_df: pd.DataFrame, theme_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Compare AI-estimated coverage percentages with actual results"""
     if not theme_dict or "major_themes" not in theme_dict:
@@ -2619,8 +2770,8 @@ with st.sidebar:
     single_or_multi = "Multi" if allow_multicode else "Single"
 
     low_thresh = st.slider("Low confidence threshold", 0.0, 1.0, 0.60, 0.01)
-    tiny_threshold = st.slider("Tiny theme threshold, percent", 0.0, 10.0, 1.0, 0.5, 
-                             help="Warns when too many single-response themes exist - suggests consolidation into 'Other' categories")
+    # Tiny theme threshold is auto-calculated after assignments for consistency
+    tiny_threshold = None
 
 
 uploaded = st.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx"])
@@ -2654,7 +2805,7 @@ text_col = st.selectbox("Select the open‑end column", options=df.columns.tolis
 # Reset downstream results if the uploaded file or selected column changed
 _input_sig = (uploaded.name, getattr(uploaded, "size", None), text_col)
 if st.session_state.get("_input_sig") != _input_sig:
-    for k in ("assigned_raw", "theme_validation", "_usage_totals", "review_page"):
+    for k in ("assigned_raw", "theme_validation", "_usage_totals", "_auto_verified"):
         st.session_state.pop(k, None)
     st.session_state["_input_sig"] = _input_sig
 
@@ -2959,6 +3110,35 @@ if theme_source == "Generate new themes":
 if "theme_dict" not in st.session_state or "assigned_raw" not in st.session_state:
     st.stop()
 
+# Auto-merge tiny sub-themes into "Other" based on dynamic thresholds
+dynamic_thresholds = calculate_dynamic_thresholds(
+    st.session_state.get("theme_dict"),
+    st.session_state.get("assigned_raw"),
+)
+tiny_threshold = dynamic_thresholds.get("tiny_threshold", 1.0)
+other_usage_threshold = dynamic_thresholds.get("other_usage_threshold", 15.0)
+
+merged_theme_dict, merged_assignments, merge_report = auto_merge_tiny_subthemes(
+    st.session_state["theme_dict"],
+    st.session_state["assigned_raw"],
+    tiny_threshold_pct=tiny_threshold,
+    other_usage_threshold_pct=other_usage_threshold,
+)
+st.session_state["theme_dict"] = merged_theme_dict
+st.session_state["assigned_raw"] = merged_assignments
+st.session_state["merge_report"] = merge_report
+
+if merge_report.get("merged_count", 0) > 0:
+    st.info(
+        f"Auto-merged {merge_report['merged_count']} tiny sub-themes into 'Other' "
+        f"(threshold: {tiny_threshold:.2f}%)."
+    )
+if merge_report.get("other_exceeded"):
+    st.warning(
+        "⚠️ 'Other' share is high in at least one major theme. "
+        "Consider regenerating themes with stricter consolidation guidance."
+    )
+
 # Show theme quality validation
 if "theme_validation" in st.session_state:
     validation = st.session_state["theme_validation"]
@@ -3148,47 +3328,47 @@ for item in st.session_state["assigned_raw"]:
         item_for_review["text"] = ser_ai.iloc[idx] if isinstance(idx, int) and 0 <= idx < len(ser_ai) else ""
         flagged.append(item_for_review)
 
-# Review options
+# Review options (automatic verification only)
 if flagged:
     st.write(f"**⚠️ {len(flagged)} responses flagged for review (confidence < {low_thresh})**")
-    
+
     # Analyze low-confidence patterns for theme suggestions
     pattern_analysis = analyze_low_confidence_patterns(flagged, st.session_state.get("question_context"))
-    
+
     if pattern_analysis["patterns"]:
         with st.expander("🔍 **Theme Pattern Analysis** - Potential New Themes", expanded=False):
             st.write("**Detected patterns in low-confidence responses:**")
-            
+
             for pattern in pattern_analysis["patterns"]:
                 st.write(f"**{pattern['pattern_name']}** ({pattern['response_count']} responses)")
                 st.caption(f"Common words: {', '.join(pattern['common_words'])}")
-                
+
                 # Show sample responses
                 with st.expander(f"Sample responses for {pattern['pattern_name']}", expanded=False):
                     for i, sample in enumerate(pattern['sample_responses'], 1):
                         st.write(f"{i}. {sample}")
-            
+
             # Add new theme functionality
             st.write("**💡 Add New Theme/Sub-theme:**")
-            
+
             col1, col2 = st.columns(2)
             with col1:
                 new_theme_type = st.selectbox("Theme Type", ["sub_theme", "major_theme"], key="new_theme_type")
-            
+
             with col2:
                 if new_theme_type == "sub_theme":
                     # Get available major themes
                     major_theme_options = []
                     for major in st.session_state["theme_dict"].get("major_themes", []):
                         major_theme_options.append((major["id"], major["label"]))
-                    
+
                     parent_theme = st.selectbox("Parent Major Theme", major_theme_options, key="parent_theme")
                 else:
                     parent_theme = None
-            
+
             new_theme_name = st.text_input("New Theme Name", key="new_theme_name")
             new_theme_definition = st.text_area("Theme Definition", key="new_theme_definition")
-            
+
             col3, col4 = st.columns(2)
             with col3:
                 if st.button("➕ Add New Theme", type="secondary"):
@@ -3200,13 +3380,13 @@ if flagged:
                             "parent_theme_id": parent_theme[0] if parent_theme else None,
                             "sample_responses": [pattern["sample_responses"][0] for pattern in pattern_analysis["patterns"]]
                         }
-                        
+
                         # Add to theme dictionary
                         updated_theme_dict = add_new_theme_to_dictionary(st.session_state["theme_dict"], new_theme)
                         st.session_state["theme_dict"] = updated_theme_dict
-                        
+
                         st.success(f"✅ Added new {new_theme_type}: {new_theme_name}")
-                        
+
                         # Offer to re-assign with new themes
                         if st.button("🔄 Re-assign All Responses with New Themes", type="primary"):
                             st.info("Re-assigning all responses with the expanded theme dictionary...")
@@ -3215,121 +3395,39 @@ if flagged:
                         st.rerun()
                     else:
                         st.error("Please provide both theme name and definition")
-            
+
             with col4:
                 if st.button("🤖 AI Suggest Themes", type="secondary"):
                     st.info("🤖 AI theme suggestion feature coming soon! For now, use the pattern analysis above to manually create themes.")
-    
-    review_mode = st.radio("Review mode", ["Automatic verification", "Manual review"], horizontal=True)
+
+    if not st.session_state.get("_auto_verified"):
+        with st.spinner("Auto re-checking low confidence assignments..."):
+            verified, usage_verify = verify_low_confidence(
+                client,
+                model,
+                st.session_state["theme_dict"],
+                flagged,
+                low_thresh=low,
+                max_codes=(max_codes if allow_multicode else 1),
+                seed=seed,
+            )
+
+            # Replace items by idx - ensure clean structure
+            by_idx = {x["idx"]: x for x in st.session_state["assigned_raw"]}
+            for v in verified:
+                cleaned_item = {
+                    "idx": v["idx"],
+                    "assignments": v.get("assignments", [])
+                }
+                by_idx[v["idx"]] = cleaned_item
+            st.session_state["assigned_raw"] = [by_idx[i] for i in sorted(by_idx.keys())]
+            st.session_state["_auto_verified"] = True
+
+            st.success(f"✅ Auto re-checked {len(verified)} assignments")
+    else:
+        st.caption("Auto-verification already completed for this run.")
 else:
     st.success("✅ All responses have high confidence scores - no review needed!")
-    review_mode = "Automatic verification"
-
-if review_mode == "Manual review":
-    st.write(f"**{len(flagged)} responses flagged for manual review (confidence < {low_thresh})**")
-    
-    if flagged:
-        # Create a simple pagination system
-        if "review_page" not in st.session_state:
-            st.session_state["review_page"] = 0
-        
-        page_size = 5
-        total_pages = (len(flagged) + page_size - 1) // page_size
-        start_idx = st.session_state["review_page"] * page_size
-        end_idx = min(start_idx + page_size, len(flagged))
-        
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col1:
-            if st.button("← Previous", disabled=st.session_state["review_page"] == 0):
-                st.session_state["review_page"] -= 1
-                st.rerun()
-        with col2:
-            st.write(f"Page {st.session_state['review_page'] + 1} of {total_pages}")
-        with col3:
-            if st.button("Next →", disabled=st.session_state["review_page"] >= total_pages - 1):
-                st.session_state["review_page"] += 1
-                st.rerun()
-        
-        # Show current batch for review
-        for i in range(start_idx, end_idx):
-            item = flagged[i]
-            idx = item["idx"]
-            original_text = ser.iloc[idx]
-            current_assignments = item.get("assignments", [])
-            
-            st.write(f"**Response {idx + 1}:** {original_text}")
-            assignments_text = [f"{a.get('theme_id', '')} (conf: {a.get('confidence', 0):.2f})" for a in current_assignments]
-            st.write(f"**Current assignments:** {assignments_text}")
-            
-            # Show rationale if available (only for low confidence items)
-            rationale = item.get("rationale", "")
-            if rationale:
-                st.write(f"**AI Rationale:** {rationale}")
-            
-            # Manual override options
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                # Show available themes for manual selection
-                theme_options = []
-                for major in st.session_state["theme_dict"].get("major_themes", []):
-                    theme_options.append((major["id"], f"{major['label']} (Major)"))
-                    for sub in major.get("subs", []):
-                        theme_options.append((sub["id"], f"{sub['label']} (Sub of {major['label']})"))
-                
-                selected_themes = st.multiselect(
-                    f"Select themes for response {idx + 1}:",
-                    options=[opt[0] for opt in theme_options],
-                    format_func=lambda x: next(opt[1] for opt in theme_options if opt[0] == x),
-                    default=[a.get("theme_id") for a in current_assignments if a.get("theme_id")],
-                    key=f"manual_review_{idx}"
-                )
-            
-            with col2:
-                if st.button(f"Update {idx + 1}", key=f"update_{idx}"):
-                    new_assignments = [{"theme_id": theme_id, "confidence": 1.0} for theme_id in selected_themes]
-
-                    # Update in session state (avoid persisting review-only fields like "text")
-                    by_idx = {x["idx"]: x for x in st.session_state["assigned_raw"]}
-                    updated_item = by_idx.get(idx, {"idx": idx})
-                    updated_item["assignments"] = new_assignments
-                    updated_item["rationale"] = "Manually reviewed and updated"
-                    by_idx[idx] = updated_item
-                    st.session_state["assigned_raw"] = [by_idx[i] for i in sorted(by_idx.keys())]
-                    st.success(f"Updated response {idx + 1}")
-                    st.rerun()
-            
-            st.divider()
-    else:
-        st.success("No responses need manual review!")
-
-else:  # Automatic verification
-    if flagged:
-        if st.button(f"Re‑check {len(flagged)} low‑confidence assignments", type="primary"):
-            with st.spinner("Re-checking low confidence assignments..."):
-                verified, usage_verify = verify_low_confidence(
-                    client,
-                    model,
-                    st.session_state["theme_dict"],
-                    flagged,
-                    low_thresh=low,
-                    max_codes=(max_codes if allow_multicode else 1),
-                    seed=seed,
-                )
-
-                # Replace items by idx - ensure clean structure
-                by_idx = {x["idx"]: x for x in st.session_state["assigned_raw"]}
-                for v in verified:
-                    # Clean the verified item to match original structure
-                    cleaned_item = {
-                        "idx": v["idx"],
-                        "assignments": v.get("assignments", [])
-                    }
-                    by_idx[v["idx"]] = cleaned_item
-                st.session_state["assigned_raw"] = [by_idx[i] for i in sorted(by_idx.keys())]
-                
-                st.success(f"✅ Re-checked {len(verified)} assignments")
-    else:
-        st.caption("No rows under the low confidence threshold.")
 
 
 # Theme distribution for charting, with volume weights
@@ -3516,6 +3614,10 @@ else:
 # Theme distribution analysis using tiny_threshold
 st.write("**Theme Distribution Analysis**")
 theme_analysis = analyze_theme_distribution(coded_df, tiny_threshold, st.session_state.get("theme_dict"))
+st.caption(f"Auto tiny-theme threshold: {tiny_threshold:.2f}% based on assignment distribution.")
+if dynamic_thresholds.get("recommendations"):
+    for rec in dynamic_thresholds["recommendations"]:
+        st.caption(f"• {rec}")
 
 # ------------------------------
 # Export
