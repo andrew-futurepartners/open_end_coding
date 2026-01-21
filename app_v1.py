@@ -40,6 +40,52 @@ from openai import OpenAI
 from openai import RateLimitError
 from dotenv import load_dotenv
 
+from assignment_utils import (
+    build_assignments_list,
+    make_assignment_decision_schema,
+    normalize_assignment_result,
+    normalize_candidate_ids,
+    stable_candidate_key,
+)
+from candidate_retrieval import (
+    build_subtheme_records,
+    embed_texts,
+    get_candidate_ids,
+    theme_signature,
+)
+from pipeline.assignment import (
+    ASSIGNMENT_STAGE2_SYSTEM as PIPE_ASSIGNMENT_STAGE2_SYSTEM,
+    ASSIGNMENT_STAGE2_USER_TEMPLATE as PIPE_ASSIGNMENT_STAGE2_USER_TEMPLATE,
+    assign_codes_two_stage as pipeline_assign_codes_two_stage,
+)
+from pipeline.governance import govern_theme_dict as pipeline_govern_theme_dict
+from pipeline.llm_client import (
+    CacheStats,
+    RateLimiter,
+    SQLiteCache,
+    compute_prompt_version,
+    oai_json_completion as pipeline_oai_json_completion,
+)
+from pipeline.run_audit import build_run_audit, compute_run_id, dataset_signature
+from pipeline.theme_discovery import (
+    THEME_DISCOVERY_SYSTEM as PIPE_THEME_DISCOVERY_SYSTEM,
+    THEME_DISCOVERY_USER as PIPE_THEME_DISCOVERY_USER,
+    build_theme_frame_with_progress as pipeline_build_theme_frame_with_progress,
+)
+from pipeline.governance import (
+    GOVERNANCE_SYSTEM as PIPE_GOVERNANCE_SYSTEM,
+    GOVERNANCE_USER_TEMPLATE as PIPE_GOVERNANCE_USER_TEMPLATE,
+)
+from pipeline.utils import chunk_data, estimate_tokens, safe_prompt_token_budget
+from theme_governance import (
+    GOVERNANCE_SCHEMA,
+    THEME_SCHEMA,
+    apply_governance_change_log,
+    normalize_change_log,
+    normalize_theme_dict_order,
+    validate_json_schema,
+)
+
 
 # ------------------------------
 # Utilities
@@ -71,9 +117,25 @@ def get_openai_client() -> OpenAI:
     # Add a sane timeout for reliability (supported by OpenAI Python 1.x)
     return OpenAI(
         api_key=api_key,
-        timeout=float(os.getenv("OPENAI_TIMEOUT_SECONDS", "120")),
+        timeout=float(os.getenv("OPENAI_TIMEOUT_SECONDS", "300")),
         max_retries=0,  # we handle retries explicitly (avoid double-retry) :contentReference[oaicite:11]{index=11}
     )
+
+
+@st.cache_resource
+def get_rate_limiter() -> RateLimiter:
+    return RateLimiter(DEFAULT_RPM, DEFAULT_TPM)
+
+
+@st.cache_resource
+def get_llm_cache() -> SQLiteCache:
+    return SQLiteCache(os.path.join("cache", "llm_cache.sqlite"))
+
+
+def get_cache_stats() -> CacheStats:
+    if "_cache_stats" not in st.session_state:
+        st.session_state["_cache_stats"] = CacheStats()
+    return st.session_state["_cache_stats"]
 
 
 
@@ -340,205 +402,18 @@ def deduplicate_responses(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, An
 
 
 def process_chunk_batch(client: OpenAI, model: str, theme_dict: Dict[str, Any], chunks: List[List[Dict[str, Any]]], max_codes: int, seed: int | None) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Process multiple chunks in parallel for faster assignment"""
-    theme_json = json.dumps(slim_theme_for_assignment(theme_dict))
-    all_assignments = []
-    total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-    
-    def process_single_chunk(chunk):
-        """Process a single chunk"""
-        responses_json = json.dumps(chunk)
-        user = ASSIGNMENT_USER_TEMPLATE.format(max_codes=max_codes, theme_json=theme_json, responses_json=responses_json)
-        
-        def make_request():
-            return oai_json_completion(client, model, ASSIGNMENT_SYSTEM, user, seed, ASSIGNMENTS_SCHEMA)
-        
-        return retry_with_backoff(make_request)
-    
-    # Process chunks in parallel (limit to 3 concurrent requests to respect rate limits)
-    max_workers = min(3, len(chunks))
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all chunks for processing
-        future_to_chunk = {executor.submit(process_single_chunk, chunk): chunk for chunk in chunks}
-        
-        # Collect results as they complete
-        for future in concurrent.futures.as_completed(future_to_chunk):
-            try:
-                data, usage = future.result()
-                
-                # Data expected as object with results array
-                if isinstance(data, dict) and "results" in data:
-                    data = data["results"]
-                else:
-                    # Fallback for backward compatibility
-                    data = data if isinstance(data, list) else []
-                
-                all_assignments.extend(data)
-                
-                # Accumulate usage
-                total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
-                
-            except Exception as e:
-                st.error(f"Error processing chunk: {str(e)}")
-                raise e
-    
-    return all_assignments, total_usage
+    """Deprecated: use two-stage assignment pipeline."""
+    raise NotImplementedError("process_chunk_batch is deprecated in favor of two-stage assignment.")
 
 
 def process_chunk_batch_optimized(client: OpenAI, model: str, theme_dict: Dict[str, Any], chunks: List[List[Dict[str, Any]]], max_codes: int, seed: int | None, progress_bar=None, status_text=None) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Optimized batch processing with higher parallelism and better error handling"""
-    theme_json = json.dumps(slim_theme_for_assignment(theme_dict))
-    all_assignments = []
-    total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-    
-    def process_single_chunk(chunk):
-        """Process a single chunk with optimized prompt"""
-        responses_json = json.dumps(chunk)
-        
-        # Use the same structured template as the single request version
-        user = ASSIGNMENT_USER_TEMPLATE.format(max_codes=max_codes, theme_json=theme_json, responses_json=responses_json)
-        
-        def make_request():
-            return oai_json_completion(client, model, ASSIGNMENT_SYSTEM, user, seed, ASSIGNMENTS_SCHEMA)
-        
-        return retry_with_backoff(make_request)
-    
-    # Use conservative parallelism for GPT-5 (up to 3 concurrent requests for quality)
-    max_workers = min(3, len(chunks))
-    
-    # Progress tracking - use provided progress elements or create new ones
-    if progress_bar is None:
-        progress_bar = st.progress(0)
-    if status_text is None:
-        status_text = st.empty()
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all chunks for processing
-        future_to_chunk = {executor.submit(process_single_chunk, chunk): i for i, chunk in enumerate(chunks)}
-        
-        completed = 0
-        # Collect results as they complete
-        for future in concurrent.futures.as_completed(future_to_chunk):
-            try:
-                chunk_idx = future_to_chunk[future]
-                data, usage = future.result()
-                
-                # Data expected as object with results array
-                if isinstance(data, dict) and "results" in data:
-                    data = data["results"]
-                else:
-                    # Fallback for backward compatibility
-                    data = data if isinstance(data, list) else []
-                
-                all_assignments.extend(data)
-                
-                # Accumulate usage
-                total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
-                
-                completed += 1
-                # Update progress within the assignment phase (30-95% range)
-                if progress_bar is not None:
-                    progress_bar.progress(30 + (completed * 65 // len(chunks)))
-                if status_text is not None:
-                    status_text.text(f"🏷️ Processing assignment chunk {completed}/{len(chunks)}")
-                
-            except Exception as e:
-                st.error(f"Error processing chunk {chunk_idx + 1}: {str(e)}")
-                raise e
-    
-    if status_text is not None:
-        status_text.text("✅ Assignment processing complete!")
-    return all_assignments, total_usage
+    """Deprecated: use two-stage assignment pipeline."""
+    raise NotImplementedError("process_chunk_batch_optimized is deprecated in favor of two-stage assignment.")
 
 
 # ------------------------------
 # JSON Schemas for faster parsing
 # ------------------------------
-
-ASSIGNMENTS_SCHEMA = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "assignments",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "results": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "idx": {"type": "integer"},
-                            "assignments": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "theme_id": {"type": "string"},
-                                        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
-                                    },
-                                    "required": ["theme_id", "confidence"],
-                                    "additionalProperties": False
-                                }
-                            }
-                        },
-                        "required": ["idx", "assignments"],
-                        "additionalProperties": False
-                    }
-                }
-            },
-            "required": ["results"],
-            "additionalProperties": False
-        },
-        "strict": True
-    }
-}
-
-THEME_SCHEMA = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "theme_dictionary",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "major_themes": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "label": {"type": "string"},
-                            "definition": {"type": "string"},
-                            "approx_pct": {"type": "number", "minimum": 0, "maximum": 1},
-                            "subs": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "id": {"type": "string"},
-                                        "label": {"type": "string"},
-                                        "definition": {"type": "string"},
-                                        "approx_pct": {"type": "number", "minimum": 0, "maximum": 1},
-                                        "examples": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
-                                    },
-                                    "required": ["id", "label", "definition", "approx_pct", "examples"],
-                                    "additionalProperties": False,
-                                },
-                            },
-                        },
-                        "required": ["id", "label", "definition", "approx_pct", "subs"],
-                        "additionalProperties": False,
-                    },
-                }
-            },
-            "required": ["major_themes"],
-            "additionalProperties": False,
-        },
-        "strict": True,
-    },
-}
 
 def allowed_subtheme_ids(theme_dict: Dict[str, Any]) -> List[str]:
     """Return all valid *subtheme* IDs (leaf codes) in stable order."""
@@ -652,6 +527,11 @@ ASSIGNMENT_SYSTEM = (
     "You are a meticulous qualitative coder. You assign responses to themes based on their substantive content, not on response quality or survey mechanics. Focus on what respondents are actually saying about the topic."
 )
 
+ASSIGNMENT_STAGE2_SYSTEM = (
+    "You are a meticulous qualitative coder. You must choose from the provided candidate sub-themes only. "
+    "Do not invent new themes."
+)
+
 ASSIGNMENT_USER_TEMPLATE = (
     """
 You will assign the following responses to the provided theme dictionary.
@@ -674,6 +554,37 @@ Return JSON in this exact format:
 
 Theme dictionary:
 {theme_json}
+
+Responses:
+{responses_json}
+"""
+)
+
+ASSIGNMENT_STAGE2_USER_TEMPLATE = (
+    """
+You will assign the following responses to the provided candidate sub-themes ONLY.
+
+Rules:
+- Choose 1..{max_codes} subtheme IDs from the candidate list.
+- If no candidate fits, choose the closest candidate but set decision="needs_review" and confidence <= 0.4.
+- Provide a short rationale (30-50 words max). No chain-of-thought.
+- If confidence < {low_thresh}, decision must be "needs_review".
+
+Return JSON in this exact format:
+{{
+  "results": [
+    {{
+      "idx": <row index integer>,
+      "subtheme_ids": ["T1.2"],
+      "confidence": 0.87,
+      "decision": "ok",
+      "rationale": "Short justification."
+    }}
+  ]
+}}
+
+Candidate sub-themes:
+{candidate_json}
 
 Responses:
 {responses_json}
@@ -779,6 +690,12 @@ class OAICounter:
 
 
 
+class JsonParseError(ValueError):
+    def __init__(self, message: str, raw_text: str):
+        super().__init__(message)
+        self.raw_text = raw_text
+
+
 def _schema_to_responses_text_format(response_schema: Dict[str, Any]) -> Dict[str, Any]:
     """
     Your schemas are currently in Chat Completions format:
@@ -817,114 +734,88 @@ def oai_json_completion(
     reasoning_effort: str | None = "minimal",   # GPT-5: minimal/medium/high; GPT-5.1: none/low/...
     verbosity: str | None = "low",
     reserve_output_tokens: int = 8_000,
-) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """
-    Single entry point for JSON outputs.
-    - Centralized rate limiting
-    - Responses API for GPT-5 family when available
-    - Chat Completions fallback
-    """
-    # Token estimate for limiter (compact schema to reduce overhead)
-    schema_str = ""
-    if response_schema:
-        schema_str = json.dumps(response_schema, ensure_ascii=False, separators=(",", ":"))
-
-    est = (
-        estimate_tokens(system, model=model)
-        + estimate_tokens(user, model=model)
-        + (estimate_tokens(schema_str, model=model) if schema_str else 0)
-        + 200  # small fixed overhead
+    return_raw: bool = False,
+) -> Tuple[Dict[str, Any], Dict[str, int]] | Tuple[Dict[str, Any], Dict[str, int], str]:
+    limiter = get_rate_limiter()
+    cache = get_llm_cache()
+    cache_stats = get_cache_stats()
+    data, usage, raw, _ = pipeline_oai_json_completion(
+        client,
+        model,
+        system,
+        user,
+        seed,
+        response_schema,
+        limiter=limiter,
+        cache=cache,
+        cache_stats=cache_stats,
+        reasoning_effort=reasoning_effort,
+        verbosity=verbosity,
+        reserve_output_tokens=reserve_output_tokens,
     )
-    check_rate_limits(est)
+    if return_raw:
+        return data, usage, raw
+    return data, usage
 
-    # Keep prompts safely under max input budget
-    budget = safe_prompt_token_budget(model, reserve_output_tokens=reserve_output_tokens)
-    if est > budget:
-        raise ValueError(
-            f"Prompt too large for safe budget (estimated {est} tokens > budget {budget}). "
-            f"Chunk the inputs more aggressively."
-        )
 
-    # --- Responses API path (preferred for GPT-5 family) ---
-    if _should_use_responses_api(client, model):
-        text_format = _schema_to_responses_text_format(response_schema) if response_schema else {"type": "json_object"}
+# ------------------------------
+# JSON validation + repair
+# ------------------------------
 
-        # GPT-5.1 docs: temperature/top_p only supported when reasoning.effort == "none" :contentReference[oaicite:16]{index=16}
-        # So we avoid temperature entirely for GPT-5 family and steer via reasoning + verbosity.
-        response_params = {
-            "model": model,
-            "input": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "reasoning": {"effort": reasoning_effort} if reasoning_effort else None,
-            "text": {"format": text_format, "verbosity": verbosity} if verbosity else {"format": text_format},
-            "seed": seed,
-            "max_output_tokens": reserve_output_tokens,
-        }
+REPAIR_SYSTEM = "You are a JSON repair tool that returns strictly valid JSON."
 
-        # Some SDK versions don't support seed in Responses API
-        try:
-            resp = client.responses.create(**response_params)
-        except TypeError as e:
-            if "seed" in response_params:
-                response_params.pop("seed", None)
-                resp = client.responses.create(**response_params)
-            else:
-                raise e
+REPAIR_USER_TEMPLATE = (
+    "You will fix invalid JSON so it conforms exactly to the provided JSON schema.\n"
+    "Return corrected JSON only. No commentary, no code fences.\n\n"
+    "Invalid JSON:\n{invalid_json}\n\n"
+    "JSON schema:\n{schema_json}\n"
+)
 
-        raw = getattr(resp, "output_text", None)
-        if not raw:
-            # ultra-defensive fallback if SDK changes structure
-            raw = json.dumps(resp.model_dump(), ensure_ascii=False)
 
-        try:
-            parsed = json.loads(raw)
-        except Exception as e:
-            raise ValueError(f"Failed to parse model JSON output. Raw output starts with: {raw[:200]}") from e
+def repair_json_to_schema(
+    client: OpenAI,
+    model: str,
+    invalid_json: str,
+    schema: Dict[str, Any],
+    seed: int | None,
+    context_label: str,
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    schema_json = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+    user = REPAIR_USER_TEMPLATE.format(invalid_json=invalid_json, schema_json=schema_json)
+    data, usage, _ = oai_json_completion(
+        client,
+        model,
+        REPAIR_SYSTEM,
+        user,
+        seed,
+        response_schema=schema,
+        reasoning_effort="minimal",
+        verbosity="low",
+        reserve_output_tokens=4_000,
+        return_raw=True,
+    )
+    ok, err = validate_json_schema(data, schema)
+    if not ok:
+        raise ValueError(f"{context_label}: repair failed schema validation: {err}")
+    return data, usage
 
-        usage = getattr(resp, "usage", None)
-        usage_dict = {
-            "prompt_tokens": int(getattr(usage, "input_tokens", 0) or 0),
-            "completion_tokens": int(getattr(usage, "output_tokens", 0) or 0),
-        }
-        return parsed, usage_dict
 
-    # --- Chat Completions fallback ---
-    request_params: Dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "seed": seed,
-    }
+def validate_or_repair_json(
+    client: OpenAI,
+    model: str,
+    parsed: Dict[str, Any],
+    raw_text: str,
+    schema: Dict[str, Any],
+    seed: int | None,
+    context_label: str,
+) -> Tuple[Dict[str, Any], Dict[str, int], bool]:
+    ok, err = validate_json_schema(parsed, schema)
+    if ok:
+        return parsed, {"prompt_tokens": 0, "completion_tokens": 0}, False
 
-    if response_schema is not None:
-        request_params["response_format"] = response_schema
-    else:
-        request_params["response_format"] = {"type": "json_object"}
-
-    # IMPORTANT: GPT-5.1 guide warns temperature/top_p may error unless reasoning.effort == "none"
-    # Since we don't pass reasoning_effort through chat completions here, we keep temperature unset.
-    request_params["max_completion_tokens"] = reserve_output_tokens
-
-    response = client.chat.completions.create(**request_params)
-    content = response.choices[0].message.content
-
-    if not content:
-        raise ValueError("Empty response content from OpenAI API")
-
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON response: {content[:200]}") from e
-
-    usage_dict = {
-        "prompt_tokens": response.usage.prompt_tokens,
-        "completion_tokens": response.usage.completion_tokens,
-    }
-    return data, usage_dict
+    invalid_text = raw_text or json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+    repaired, usage = repair_json_to_schema(client, model, invalid_text, schema, seed, context_label)
+    return repaired, usage, True
 
 
 # ------------------------------
@@ -932,143 +823,11 @@ def oai_json_completion(
 # ------------------------------
 
 def build_theme_frame(client: OpenAI, model: str, texts: List[str], freq: List[int], seed: int | None) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Create a hierarchical theme dictionary using a weighted sample of unique texts.
-    We pass a compact JSON with objects: {"text": "...", "weight": n}
-    Handles large datasets by chunking and processing in batches.
-    Pre-filters non-responses for better theme quality.
-    """
-    
-    # Pre-filter non-responses and low-quality responses
-    st.info("🔍 Pre-filtering responses for better theme discovery...")
-    
-    filtered_data = []
-    non_answer_count = 0
-    short_response_count = 0
-    
-    for t, w in zip(texts, freq):
-        if not t or is_empty_like(t):
-            non_answer_count += w  # Count frequency of non-answers
-            continue
-
-        # Keep short-but-substantive responses (e.g., "Price"); empties are already filtered above.
-        filtered_data.append({"text": t, "weight": int(w)})
-    
-    # Show filtering statistics
-    total_responses = sum(freq)
-    filtered_responses = sum(item["weight"] for item in filtered_data)
-    non_answer_pct = (non_answer_count / total_responses * 100) if total_responses > 0 else 0
-    short_response_pct = (short_response_count / total_responses * 100) if total_responses > 0 else 0
-    
-    if non_answer_count > 0 or short_response_count > 0:
-        st.success(f"📊 Pre-filtering: {total_responses} → {filtered_responses} responses")
-        if non_answer_count > 0:
-            st.caption(f"   • Removed {non_answer_count} non-answers ({non_answer_pct:.1f}%)")
-        if short_response_count > 0:
-            st.caption(f"   • Removed {short_response_count} short responses ({short_response_pct:.1f}%)")
-    
-    # Sort by weight
-    filtered_data.sort(key=lambda x: x["weight"], reverse=True)
-    
-    # Check if we need to chunk the filtered data
-    total_tokens = estimate_tokens(json.dumps(filtered_data))
-    if total_tokens <= 400000:  # GPT-5 safe token limit
-        payload = json.dumps(filtered_data)
-        user = THEME_DISCOVERY_USER + "\n\nWeighted responses (JSON array):\n" + payload
-
-        def make_request():
-            return oai_json_completion(
-                client,
-                model,
-                THEME_SYSTEM,
-                THEME_USER_TEMPLATE.format(
-                    question_context=question_context,
-                    data_json=json.dumps(filtered_data, ensure_ascii=False, separators=(",", ":"))
-                ),
-                seed,
-                response_schema=THEME_SCHEMA,
-                reasoning_effort="medium",  # theme discovery benefits from more reasoning
-                verbosity="low",
-                reserve_output_tokens=12_000
-            )
-
-        data, usage = retry_with_backoff(make_request)
-        return data, usage
-    
-    else:
-        # Process in chunks and merge results
-        st.info(f"Very large dataset detected ({total_tokens:,} tokens). Processing in chunks to optimize with GPT-5's 500K TPM limit...")
-        
-        chunks = chunk_data(filtered_data, max_tokens=350000)  # GPT-5 conservative limit
-        all_themes = []
-        total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-        
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        # Process chunks in parallel for much faster theme generation
-        def process_theme_chunk(chunk):
-            payload = json.dumps(chunk)
-            # Enhance prompt with question context
-            enhanced_prompt = THEME_DISCOVERY_USER
-            if question_context and question_context.get("type") != "general":
-                enhanced_prompt += f"\n\n**QUESTION CONTEXT**: {question_context['focus']}\n"
-                if question_context.get('priority_themes'):
-                    enhanced_prompt += f"**PRIORITY THEME AREAS**: {', '.join(question_context['priority_themes'])}\n"
-                enhanced_prompt += "Consider these priorities when creating your thematic framework.\n"
-            
-            user = enhanced_prompt + "\n\nWeighted responses (JSON array):\n" + payload
-
-            def make_chunk_request():
-                return oai_json_completion(
-                    client,
-                    model,
-                    THEME_SYSTEM,
-                    THEME_USER_TEMPLATE.format(
-                        question_context=question_context,
-                        data_json=json.dumps(chunk, ensure_ascii=False, separators=(",", ":"))
-                    ),
-                    seed,
-                    response_schema=THEME_SCHEMA,
-                    reasoning_effort="medium",
-                    verbosity="low",
-                    reserve_output_tokens=12_000
-                )
-
-            return retry_with_backoff(make_chunk_request)
-        
-        # Use parallel processing for theme generation
-        max_workers = min(5, len(chunks))  # Parallel theme generation
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_chunk = {executor.submit(process_theme_chunk, chunk): i for i, chunk in enumerate(chunks)}
-            
-            completed = 0
-            for future in concurrent.futures.as_completed(future_to_chunk):
-                chunk_idx = future_to_chunk[future]
-                try:
-                    data, usage = future.result()
-                    all_themes.extend(data.get("major_themes", []))
-                    
-                    # Accumulate usage
-                    total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                    total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
-                    
-                    completed += 1
-                    status_text.text(f"🎯 Processing theme chunk {completed}/{len(chunks)}")
-                    progress_bar.progress(30 + (completed * 60 // len(chunks)))
-                    
-                except Exception as e:
-                    st.error(f"Error processing theme chunk {chunk_idx + 1}: {str(e)}")
-                    raise e
-        
-        # Merge and deduplicate themes
-        merged_themes = merge_theme_chunks(all_themes)
-        
-        status_text.text("Theme generation complete!")
-        progress_bar.progress(1.0)
-        
-        result = {"major_themes": merged_themes}
-        return result, total_usage
+    """Deprecated: use build_theme_frame_with_progress for schema-safe discovery."""
+    raise NotImplementedError(
+        "build_theme_frame is deprecated and not safe for schema-validated discovery. "
+        "Use build_theme_frame_with_progress instead."
+    )
 
 
 def calculate_dynamic_thresholds(theme_dict: Dict[str, Any], assigned_data: List[Dict] = None) -> Dict[str, float]:
@@ -1530,130 +1289,24 @@ def detect_question_type(question_text):
         }
 
 def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str], freq: List[int], seed: int | None, progress_bar, status_text, question_context: Dict = None) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Create a hierarchical theme dictionary with detailed progress tracking."""
-    
-    # Pre-filter non-responses and low-quality responses
-    status_text.text("🔍 Pre-filtering responses for better theme discovery...")
-    progress_bar.progress(10)
-    
-    filtered_data = []
-    non_answer_count = 0
-    short_response_count = 0
-    
-    for t, w in zip(texts, freq):
-        if not t or is_empty_like(t):
-            non_answer_count += w  # Count frequency of non-answers
-            continue
-        
-        # Filter out very short responses that are likely non-substantive
-        # Keep short-but-substantive responses (e.g., "Price"); only filter true non-answers above.
-        filtered_data.append({
-            "text": t,
-            "weight": int(w)
-        })
+    limiter = get_rate_limiter()
+    cache = get_llm_cache()
+    cache_stats = get_cache_stats()
 
-    # Show filtering statistics
-    total_responses = sum(freq)
-    filtered_responses = sum(item["weight"] for item in filtered_data)
-    non_answer_pct = (non_answer_count / total_responses * 100) if total_responses > 0 else 0
-    short_response_pct = (short_response_count / total_responses * 100) if total_responses > 0 else 0
-    
-    status_text.text(f"📊 Pre-filtering: {total_responses} → {filtered_responses} responses")
-    progress_bar.progress(20)
-    
-    # Sort by weight
-    filtered_data.sort(key=lambda x: x["weight"], reverse=True)
-
-    safe_limit = safe_prompt_token_budget(model, reserve_output_tokens=12_000)
-    total_tokens = estimate_tokens(
-        json.dumps(filtered_data, ensure_ascii=False, separators=(",", ":")),
-        model=model
+    return pipeline_build_theme_frame_with_progress(
+        client,
+        model,
+        texts,
+        freq,
+        seed,
+        limiter=limiter,
+        cache=cache,
+        cache_stats=cache_stats,
+        question_context=question_context,
+        on_status=status_text.text if status_text else None,
+        on_progress=progress_bar.progress if progress_bar else None,
+        on_notice=st.info,
     )
-
-    if total_tokens <= safe_limit:
-        status_text.text("🎯 Generating themes from all responses...")
-        progress_bar.progress(50)
-        
-        payload = json.dumps(filtered_data)
-        
-        # Enhance prompt with question context
-        enhanced_prompt = THEME_DISCOVERY_USER
-        if question_context and question_context.get("type") != "general":
-            enhanced_prompt += f"\n\n**QUESTION CONTEXT**: {question_context['focus']}\n"
-            if question_context.get('priority_themes'):
-                enhanced_prompt += f"**PRIORITY THEME AREAS**: {', '.join(question_context['priority_themes'])}\n"
-            enhanced_prompt += "Consider these priorities when creating your thematic framework.\n"
-        
-        user = enhanced_prompt + "\n\nWeighted responses (JSON array):\n" + payload
-        
-        def make_request():
-            return oai_json_completion(client, model, THEME_DISCOVERY_SYSTEM, user, seed)
-        
-        data, usage = retry_with_backoff(make_request)
-        progress_bar.progress(100)
-        return data, usage
-    
-    else:
-        # Process in chunks and merge results
-        st.warning("Large dataset detected. Processing in chunks for stability...")
-        chunk_budget = int(safe_limit * 0.80)  # leave room for system + question_context
-        chunks = chunk_data(filtered_data, max_tokens=chunk_budget, model=model)
-
-        all_themes = []
-        total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-        
-        # Process chunks in parallel for much faster theme generation
-        def process_theme_chunk(chunk):
-            payload = json.dumps(chunk)
-            # Enhance prompt with question context
-            enhanced_prompt = THEME_DISCOVERY_USER
-            if question_context and question_context.get("type") != "general":
-                enhanced_prompt += f"\n\n**QUESTION CONTEXT**: {question_context['focus']}\n"
-                if question_context.get('priority_themes'):
-                    enhanced_prompt += f"**PRIORITY THEME AREAS**: {', '.join(question_context['priority_themes'])}\n"
-                enhanced_prompt += "Consider these priorities when creating your thematic framework.\n"
-            
-            user = enhanced_prompt + "\n\nWeighted responses (JSON array):\n" + payload
-            
-            def make_chunk_request():
-                return oai_json_completion(client, model, THEME_DISCOVERY_SYSTEM, user, seed)
-            
-            return retry_with_backoff(make_chunk_request)
-        
-        # Use parallel processing for theme generation
-        max_workers = min(3, len(chunks))  # Parallel theme generation
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_chunk = {executor.submit(process_theme_chunk, chunk): i for i, chunk in enumerate(chunks)}
-            
-            completed = 0
-            for future in concurrent.futures.as_completed(future_to_chunk):
-                chunk_idx = future_to_chunk[future]
-                try:
-                    data, usage = future.result()
-                    all_themes.extend(data.get("major_themes", []))
-                    
-                    # Accumulate usage
-                    total_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
-                    total_usage["completion_tokens"] += usage.get("completion_tokens", 0)
-                    
-                    completed += 1
-                    status_text.text(f"🎯 Processing theme chunk {completed}/{len(chunks)}")
-                    progress_bar.progress(30 + (completed * 60 // len(chunks)))
-                    
-                except Exception as e:
-                    st.error(f"Error processing theme chunk {chunk_idx + 1}: {str(e)}")
-                    raise e
-        
-        # Merge and deduplicate themes
-        status_text.text("🔄 Merging and deduplicating themes...")
-        progress_bar.progress(90)
-        
-        merged_themes = merge_theme_chunks(all_themes)
-        result = {"major_themes": merged_themes}
-        
-        progress_bar.progress(100)
-        return result, total_usage
 
 
 
@@ -1784,7 +1437,90 @@ def merge_theme_chunks(theme_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any
     return ordered
 
 
-def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: List[Dict[str, Any]], max_codes: int, seed: int | None) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+GOVERNANCE_SYSTEM = (
+    "You are a senior qualitative research methodologist. "
+    "You reduce overlap, normalize naming, and enforce consistent granularity in a theme dictionary. "
+    "You preserve meaning and avoid inventing new concepts."
+)
+
+GOVERNANCE_USER_TEMPLATE = (
+    """
+You will review and improve a hierarchical theme dictionary for a survey open-end question.
+
+Goals:
+- Reduce duplicate or overlapping sub-themes.
+- Normalize naming for clarity and consistency.
+- Normalize granularity so peers are at similar specificity.
+- Preserve meaning and avoid new concepts unless strictly necessary.
+- DO NOT change the Non-answer major theme or its sub-themes.
+- Keep existing IDs whenever possible. Only create new IDs if a split is absolutely required.
+- If you must add IDs, use deterministic numbering within the parent major theme (e.g., T2.7).
+
+Return JSON that includes:
+1) "theme_dict": the full corrected dictionary (schema enforced).
+2) "change_log": a list of actions describing the changes.
+
+Allowed change_log actions:
+- merge: merge several sub-themes into one
+- split: split one sub-theme into several (use sparingly)
+- rename: rename a theme without changing meaning
+- move: move a sub-theme to a different major theme
+
+Each change_log entry must include:
+{{
+  "action": "merge|split|rename|move",
+  "from_ids": ["..."],
+  "to_ids": ["..."],
+  "reason": "short explanation"
+}}
+
+Question context (if available):
+{question_context}
+
+Theme dictionary:
+{theme_json}
+"""
+)
+
+
+def govern_theme_dict(
+    client: OpenAI,
+    model: str,
+    theme_dict: Dict[str, Any],
+    question_context: Dict[str, Any] | None,
+    seed: int | None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, int]]:
+    limiter = get_rate_limiter()
+    cache = get_llm_cache()
+    cache_stats = get_cache_stats()
+    return pipeline_govern_theme_dict(
+        client,
+        model,
+        theme_dict,
+        question_context,
+        seed,
+        limiter=limiter,
+        cache=cache,
+        cache_stats=cache_stats,
+        on_notice=st.warning,
+    )
+
+
+def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: List[Dict[str, Any]], max_codes: int, seed: int | None,
+                 low_thresh: float, top_k: int, embedding_model: str) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    return assign_codes_two_stage(
+        client,
+        model,
+        theme_dict,
+        rows,
+        max_codes,
+        seed,
+        low_thresh,
+        top_k,
+        embedding_model,
+        progress_bar=None,
+        status_text=None,
+    )
     
     # Step 1: Aggressive pre-filtering and deduplication
     st.info("🔍 Pre-filtering and deduplicating responses...")
@@ -1914,8 +1650,22 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
 
 
 def assign_codes_with_progress(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: List[Dict[str, Any]],
-                               max_codes: int, seed: int | None, progress_bar, status_text) -> Tuple[
+                               max_codes: int, seed: int | None, low_thresh: float, top_k: int, embedding_model: str,
+                               progress_bar, status_text) -> Tuple[
     List[Dict[str, Any]], Dict[str, int]]:
+    return assign_codes_two_stage(
+        client,
+        model,
+        theme_dict,
+        rows,
+        max_codes,
+        seed,
+        low_thresh,
+        top_k,
+        embedding_model,
+        progress_bar=progress_bar,
+        status_text=status_text,
+    )
     """Assign themes to responses with progress tracking.
 
     Improvements vs v1:
@@ -2275,6 +2025,40 @@ def slim_theme_for_assignment(theme_dict: Dict[str, Any]) -> Dict[str, Any]:
     return {"major_themes": majors_sorted}
 
 
+def assign_codes_two_stage(
+    client: OpenAI,
+    model: str,
+    theme_dict: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    max_codes: int,
+    seed: int | None,
+    low_thresh: float,
+    top_k: int,
+    embedding_model: str,
+    progress_bar=None,
+    status_text=None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    limiter = get_rate_limiter()
+    cache = get_llm_cache()
+    cache_stats = get_cache_stats()
+    return pipeline_assign_codes_two_stage(
+        client,
+        model,
+        theme_dict,
+        rows,
+        max_codes,
+        seed or 42,
+        low_thresh,
+        top_k,
+        embedding_model,
+        limiter=limiter,
+        cache=cache,
+        cache_stats=cache_stats,
+        on_status=status_text.text if status_text else None,
+        on_progress=progress_bar.progress if progress_bar else None,
+    )
+
+
 def expand_deduplicated_results(unique_assignments: List[Dict[str, Any]], response_to_indices: Dict[str, List[int]]) -> List[Dict[str, Any]]:
     """Expand deduplicated results back to all original responses"""
     # The unique_assignments contain assignments with idx values that correspond to 
@@ -2343,9 +2127,6 @@ def verify_low_confidence(
         user = VERIFY_USER_TEMPLATE.format(low_thresh=low_thresh, theme_json=theme_json, flagged_json=flagged_json)
         
         def make_request():
-            # Minimal rate limiting
-            estimated_tokens = estimate_tokens(flagged_json)
-            check_rate_limits(estimated_tokens)
             return oai_json_completion(client, model, VERIFY_SYSTEM, user, seed, schema)
 
         return retry_with_backoff(make_request)
@@ -2694,6 +2475,18 @@ def map_theme_id_to_major(theme_df: pd.DataFrame) -> Dict[str, str]:
     return major_of
 
 
+def governance_log_to_df(change_log: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for entry in change_log or []:
+        rows.append({
+            "Action": entry.get("action", ""),
+            "FromIDs": "; ".join(entry.get("from_ids", []) or []),
+            "ToIDs": "; ".join(entry.get("to_ids", []) or []),
+            "Reason": entry.get("reason", ""),
+        })
+    return pd.DataFrame(rows)
+
+
 # ------------------------------
 # Streamlit UI
 # ------------------------------
@@ -2769,6 +2562,13 @@ with st.sidebar:
     max_codes = 3
     single_or_multi = "Multi" if allow_multicode else "Single"
 
+    embedding_model = st.selectbox(
+        "Embedding model",
+        options=["text-embedding-3-small", "text-embedding-3-large"],
+        index=0,
+    )
+    top_k = st.slider("Candidate shortlist size (top_k)", 3, 12, 6, 1)
+
     low_thresh = st.slider("Low confidence threshold", 0.0, 1.0, 0.60, 0.01)
     # Tiny theme threshold is auto-calculated after assignments for consistency
     tiny_threshold = None
@@ -2805,7 +2605,7 @@ text_col = st.selectbox("Select the open‑end column", options=df.columns.tolis
 # Reset downstream results if the uploaded file or selected column changed
 _input_sig = (uploaded.name, getattr(uploaded, "size", None), text_col)
 if st.session_state.get("_input_sig") != _input_sig:
-    for k in ("assigned_raw", "theme_validation", "_usage_totals", "_auto_verified"):
+    for k in ("assigned_raw", "theme_validation", "_usage_totals", "_auto_verified", "theme_governance_log", "_cache_stats"):
         st.session_state.pop(k, None)
     st.session_state["_input_sig"] = _input_sig
 
@@ -2835,6 +2635,25 @@ if st.session_state.get(label_key) is None:
     with st.spinner("Inferring question label..."):
         st.session_state[label_key] = infer_question_label(client, model, question_text, seed)
 question_label = st.session_state[label_key]
+
+# Run signature + prompt versions
+dataset_sig = dataset_signature(ser_ai.fillna("").astype(str).tolist(), question_text)
+prompt_versions = {
+    "theme_discovery": compute_prompt_version(PIPE_THEME_DISCOVERY_SYSTEM, PIPE_THEME_DISCOVERY_USER),
+    "governance": compute_prompt_version(PIPE_GOVERNANCE_SYSTEM, PIPE_GOVERNANCE_USER_TEMPLATE),
+    "assignment_stage2": compute_prompt_version(PIPE_ASSIGNMENT_STAGE2_SYSTEM, PIPE_ASSIGNMENT_STAGE2_USER_TEMPLATE),
+}
+run_settings = {
+    "model": model,
+    "seed": seed,
+    "max_codes": max_codes if allow_multicode else 1,
+    "allow_multicode": allow_multicode,
+    "low_thresh": float(low_thresh),
+    "top_k": int(top_k),
+    "embedding_model": embedding_model,
+}
+run_id = compute_run_id(dataset_sig, model, seed, prompt_versions, run_settings)
+st.session_state["run_id"] = run_id
 
 st.divider()
 st.subheader("Theme discovery")
@@ -2913,7 +2732,7 @@ if theme_source == "Upload existing themes":
 
                 assigned, usage_assign = assign_codes_with_progress(
                     client, model, st.session_state["theme_dict"], rows_payload,
-                    max_codes if allow_multicode else 1, seed, apply_progress, apply_status
+                    max_codes if allow_multicode else 1, seed, low_thresh, top_k, embedding_model, apply_progress, apply_status
                 )
                 st.session_state["assigned_raw"] = assigned
                 st.success("✅ Themes applied to responses. Scroll down to review and export.")
@@ -3012,8 +2831,37 @@ if theme_source == "Generate new themes":
                 if question_context['priority_themes']:
                     st.caption(f"**Priority Themes**: {', '.join(question_context['priority_themes'])}")
             
-            theme_dict, usage_theme = build_theme_frame_with_progress(client, model, unique_texts, unique_freqs, seed, theme_progress, theme_status, question_context)
+            theme_dict, usage_theme = build_theme_frame_with_progress(
+                client,
+                model,
+                unique_texts,
+                unique_freqs,
+                seed,
+                theme_progress,
+                theme_status,
+                question_context,
+            )
             theme_dict = ensure_nonanswer_theme(theme_dict)
+
+            try:
+                theme_dict, change_log, usage_gov = govern_theme_dict(
+                    client,
+                    model,
+                    theme_dict,
+                    question_context,
+                    seed,
+                )
+                st.session_state["theme_governance_log"] = change_log
+                usage_theme["prompt_tokens"] += usage_gov.get("prompt_tokens", 0)
+                usage_theme["completion_tokens"] += usage_gov.get("completion_tokens", 0)
+                if change_log:
+                    st.info(f"✅ Theme governance applied with {len(change_log)} logged changes.")
+                else:
+                    st.caption("Theme governance applied: no overlaps or granularity issues detected.")
+            except Exception as e:
+                st.error(f"Theme governance failed: {str(e)}")
+                st.stop()
+
             st.session_state["theme_dict"] = theme_dict
             
             # Validate theme quality
@@ -3048,7 +2896,19 @@ if theme_source == "Generate new themes":
                 for i, t in enumerate(ser_ai.fillna("").astype(str).tolist())
             ]
 
-            assigned, usage_assign = assign_codes_with_progress(client, model, theme_dict, rows_payload, max_codes if allow_multicode else 1, seed, assign_progress, assign_status)
+            assigned, usage_assign = assign_codes_with_progress(
+                client,
+                model,
+                theme_dict,
+                rows_payload,
+                max_codes if allow_multicode else 1,
+                seed,
+                low_thresh,
+                top_k,
+                embedding_model,
+                assign_progress,
+                assign_status,
+            )
             st.session_state["assigned_raw"] = assigned
             
             assign_end_time = time.time()
@@ -3187,6 +3047,11 @@ with pd.ExcelWriter(comprehensive_buf, engine="xlsxwriter") as writer:
     # Add theme dictionary sheet
     theme_df.to_excel(writer, sheet_name="Theme Dictionary", index=False)
     
+    governance_log = st.session_state.get("theme_governance_log") or []
+    if governance_log:
+        governance_df = governance_log_to_df(governance_log)
+        governance_df.to_excel(writer, sheet_name="Theme Governance Log", index=False)
+    
     # Add coded data sheet (we'll need to build this first)
     if "assigned_raw" in st.session_state:
         # Build a preview of coded data for the comprehensive export
@@ -3218,7 +3083,7 @@ with pd.ExcelWriter(comprehensive_buf, engine="xlsxwriter") as writer:
             sample_coded_df.to_excel(writer, sheet_name="Sample Coded Data", index=False)
 
     # Add question mapping sheet
-    question_map_df = pd.DataFrame([{"QuestionLabel": question_label, "QuestionText": text_col}])
+    question_map_df = pd.DataFrame([{"QuestionLabel": question_label, "QuestionText": text_col, "RunId": st.session_state.get("run_id", "")}])
     question_map_df.to_excel(writer, sheet_name="Question Map", index=False)
 
 st.download_button(
@@ -3316,17 +3181,54 @@ st.subheader("Review & Verification")
 st.write("**Coded Data Preview:**")
 st.dataframe(coded_df.head(20), width="stretch")
 
-# Identify low confidence responses
+# Identify responses needing review
 low = float(low_thresh)
 flagged = []
 for item in st.session_state["assigned_raw"]:
     confs = [a.get("confidence", 0.0) for a in item.get("assignments", [])]
     top_conf = max(confs) if confs else 0.0
-    if top_conf < low:
+    decision = item.get("decision")
+    is_skipped_empty = (not item.get("assignments")) and str(item.get("rationale", "")).lower().startswith("skipped: empty")
+    needs_review = (not is_skipped_empty) and (decision == "needs_review" or top_conf < low)
+    if needs_review:
         idx = item.get("idx")
         item_for_review = dict(item)
         item_for_review["text"] = ser_ai.iloc[idx] if isinstance(idx, int) and 0 <= idx < len(ser_ai) else ""
         flagged.append(item_for_review)
+
+# Needs review table
+if flagged:
+    review_rows = []
+    for item in flagged:
+        idx = item.get("idx")
+        assigns = item.get("assignments", [])
+        assigns = sorted(assigns, key=lambda a: a.get("confidence", 0.0), reverse=True)
+        code_ids = [a.get("theme_id", "") for a in assigns if a.get("theme_id")]
+        code_labels = [label_map.get(cid, cid) for cid in code_ids]
+        conf_val = item.get("confidence")
+        if not isinstance(conf_val, (int, float)):
+            conf_val = max([a.get("confidence", 0.0) for a in assigns] or [0.0])
+
+        review_rows.append({
+            "RowIndex": idx,
+            "Response": item.get("text", ""),
+            "AssignedCodes": "; ".join(code_labels),
+            "Confidence": conf_val,
+            "Decision": item.get("decision", "needs_review"),
+            "Rationale": item.get("rationale", ""),
+        })
+
+    needs_review_df = pd.DataFrame(review_rows)
+    st.write("**Needs review**")
+    st.dataframe(needs_review_df, width="stretch")
+
+    csv_buf = needs_review_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download needs_review CSV",
+        data=csv_buf,
+        file_name=f"needs_review_{today_stamp()}.csv",
+        mime="text/csv",
+    )
 
 # Review options (automatic verification only)
 if flagged:
@@ -3415,9 +3317,17 @@ if flagged:
             # Replace items by idx - ensure clean structure
             by_idx = {x["idx"]: x for x in st.session_state["assigned_raw"]}
             for v in verified:
+                assigns = v.get("assignments", []) or []
+                confs = [a.get("confidence", 0.0) for a in assigns]
+                top_conf = max(confs) if confs else 0.0
+                decision = "needs_review" if (top_conf < low or top_conf <= 0.4) else "ok"
                 cleaned_item = {
                     "idx": v["idx"],
-                    "assignments": v.get("assignments", [])
+                    "assignments": assigns,
+                    "subtheme_ids": [a.get("theme_id") for a in assigns if a.get("theme_id")],
+                    "confidence": top_conf,
+                    "decision": decision,
+                    "rationale": "Auto re-check applied",
                 }
                 by_idx[v["idx"]] = cleaned_item
             st.session_state["assigned_raw"] = [by_idx[i] for i in sorted(by_idx.keys())]
@@ -3626,8 +3536,7 @@ if dynamic_thresholds.get("recommendations"):
 st.divider()
 st.subheader("Export")
 
-q_name = text_col.replace(" ", "_")
-file_name = f"{q_name}_thematic_coding_{today_stamp()}.xlsx"
+file_name = f"{question_label}_CODED.xlsx"
 
 # Build Theme Dictionary with shares
 major_support = counts.groupby("MajorLabel")["Count"].sum().rename("MajorCount").reset_index()
@@ -3646,10 +3555,56 @@ buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
     coded_df.to_excel(writer, sheet_name="Coded Data", index=False)
     theme_export.to_excel(writer, sheet_name="Theme Dictionary", index=False)
-    question_map_df = pd.DataFrame([{"QuestionLabel": question_label, "QuestionText": text_col}])
+    question_map_df = pd.DataFrame([{"QuestionLabel": question_label, "QuestionText": text_col, "RunId": st.session_state.get("run_id", "")}])
     question_map_df.to_excel(writer, sheet_name="Question Map", index=False)
+    governance_log = st.session_state.get("theme_governance_log") or []
+    if governance_log:
+        governance_df = governance_log_to_df(governance_log)
+        governance_df.to_excel(writer, sheet_name="Theme Governance Log", index=False)
 
 st.download_button("Download XLSX", data=buf.getvalue(), file_name=file_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ------------------------------
+# Run report
+# ------------------------------
+
+st.divider()
+st.subheader("Run report")
+
+cache_stats = get_cache_stats()
+cache_stats_dict = {
+    "hits": cache_stats.hits,
+    "misses": cache_stats.misses,
+    "saved_prompt_tokens": cache_stats.saved_prompt_tokens,
+    "saved_completion_tokens": cache_stats.saved_completion_tokens,
+}
+
+theme_params = {
+    "model": model,
+    "seed": seed,
+    "prompt_versions": prompt_versions,
+}
+assignment_params = run_settings.copy()
+
+run_audit = build_run_audit(
+    run_id=st.session_state.get("run_id", ""),
+    dataset_sig=dataset_sig,
+    question_text=text_col,
+    theme_params=theme_params,
+    governance_log=st.session_state.get("theme_governance_log", []),
+    assignment_params=assignment_params,
+    assignments=st.session_state.get("assigned_raw", []),
+    cache_stats=cache_stats_dict,
+    usage_totals=st.session_state.get("_usage_totals", {}),
+)
+
+run_report_json = json.dumps(run_audit, indent=2, ensure_ascii=False)
+st.download_button(
+    "Download run report JSON",
+    data=run_report_json,
+    file_name=f"run_report_{st.session_state.get('run_id', '')}.json",
+    mime="application/json",
+)
 
 # ------------------------------
 # Cost summary
@@ -3657,25 +3612,28 @@ st.download_button("Download XLSX", data=buf.getvalue(), file_name=file_name, mi
 
 # Initialize usage tracking
 if "_usage_totals" not in st.session_state:
-    st.session_state["_usage_totals"] = {"prompt_tokens": 0, "completion_tokens": 0}
+    st.session_state["_usage_totals"] = {"prompt_tokens": 0, "completion_tokens": 0, "embedding_tokens": 0}
 
 # Accumulate usage from completed steps
-total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "embedding_tokens": 0}
 
 # Add usage from theme generation if available
 if "usage_theme" in locals():
     total_usage["prompt_tokens"] += usage_theme.get("prompt_tokens", 0)
     total_usage["completion_tokens"] += usage_theme.get("completion_tokens", 0)
+    total_usage["embedding_tokens"] += usage_theme.get("embedding_tokens", 0)
 
 # Add usage from assignment if available
 if "usage_assign" in locals():
     total_usage["prompt_tokens"] += usage_assign.get("prompt_tokens", 0)
     total_usage["completion_tokens"] += usage_assign.get("completion_tokens", 0)
+    total_usage["embedding_tokens"] += usage_assign.get("embedding_tokens", 0)
 
 # Add usage from verification if available
 if "usage_verify" in locals():
     total_usage["prompt_tokens"] += usage_verify.get("prompt_tokens", 0)
     total_usage["completion_tokens"] += usage_verify.get("completion_tokens", 0)
+    total_usage["embedding_tokens"] += usage_verify.get("embedding_tokens", 0)
 
 # Update session state
 st.session_state["_usage_totals"] = total_usage
@@ -3695,12 +3653,22 @@ if total_usage["prompt_tokens"] > 0 or total_usage["completion_tokens"] > 0:
     
     st.divider()
     st.subheader("Cost Summary")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Prompt Tokens", f"{total_usage['prompt_tokens']:,}")
     with col2:
         st.metric("Completion Tokens", f"{total_usage['completion_tokens']:,}")
     with col3:
+        st.metric("Embedding Tokens", f"{total_usage['embedding_tokens']:,}")
+    with col4:
         st.metric("Total Cost (GPT-5)", f"${estimated_cost:.4f}")
     
+    total_tokens_all = total_usage["prompt_tokens"] + total_usage["completion_tokens"] + total_usage["embedding_tokens"]
+    per_1k = (total_tokens_all / max(1, len(df))) * 1000
+    st.caption(f"Tokens per 1k responses (all stages): {per_1k:.0f}")
+    cache_stats = get_cache_stats()
+    st.caption(
+        f"Cache hits: {cache_stats.hits} | misses: {cache_stats.misses} | "
+        f"saved tokens: {cache_stats.saved_prompt_tokens + cache_stats.saved_completion_tokens}"
+    )
     st.caption("Cost estimates based on current OpenAI pricing. High quality mode prioritizes accuracy over cost.")
