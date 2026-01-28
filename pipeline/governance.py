@@ -84,6 +84,26 @@ def govern_theme_dict(
     if not theme_dict or not theme_dict.get("major_themes"):
         return theme_dict, [], {"prompt_tokens": 0, "completion_tokens": 0}
 
+    # #region agent log
+    try:
+        majors_in = theme_dict.get("major_themes", []) if isinstance(theme_dict, dict) else []
+        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": "H13",
+                "location": "pipeline/governance.py:govern_theme_dict:input",
+                "message": "Governance input themes",
+                "data": {
+                    "major_count": len(majors_in),
+                    "major_labels": [m.get("label", "") for m in majors_in][:8],
+                },
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
     theme_json = json.dumps(theme_dict, ensure_ascii=False, separators=(",", ":"))
     qc_text = json.dumps(question_context or {}, ensure_ascii=False, separators=(",", ":"))
     try:
@@ -144,6 +164,27 @@ def govern_theme_dict(
 
     governed = apply_governance_change_log(theme_dict, proposed_theme_dict, change_log)
     governed = normalize_theme_dict_order(governed)
+
+    # #region agent log
+    try:
+        majors_out = governed.get("major_themes", []) if isinstance(governed, dict) else []
+        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": "H14",
+                "location": "pipeline/governance.py:govern_theme_dict:output",
+                "message": "Governance output themes",
+                "data": {
+                    "major_count": len(majors_out),
+                    "major_labels": [m.get("label", "") for m in majors_out][:8],
+                    "change_log_count": len(change_log or []),
+                },
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+    # #endregion
 
     ok, err = validate_json_schema(governed, THEME_SCHEMA)
     if not ok:

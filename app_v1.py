@@ -1292,6 +1292,45 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
     limiter = get_rate_limiter()
     cache = get_llm_cache()
     cache_stats = get_cache_stats()
+    # #region agent log
+    try:
+        guidance_text = st.session_state.get(f"question_guidance::{text_col}", "").strip() if "text_col" in globals() else ""
+        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": "H6",
+                "location": "app_v1.py:build_theme_frame_with_progress:wrapper",
+                "message": "Calling pipeline theme discovery",
+                "data": {
+                    "guidance_len": len(guidance_text),
+                    "text_count": len(texts or []),
+                },
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        
+    # #endregion
+    # #region agent log
+    try:
+        import sys
+        td_mod = sys.modules.get("pipeline.theme_discovery")
+        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": "H15",
+                "location": "app_v1.py:build_theme_frame_with_progress:module",
+                "message": "Theme discovery module info",
+                "data": {
+                    "module_file": getattr(td_mod, "__file__", None),
+                    "module_loaded": td_mod is not None,
+                },
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        
+    # #endregion
 
     return pipeline_build_theme_frame_with_progress(
         client,
@@ -1303,6 +1342,11 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
         cache=cache,
         cache_stats=cache_stats,
         question_context=question_context,
+        guidance_text=st.session_state.get(f"question_guidance::{text_col}", "").strip() if "text_col" in globals() else "",
+        normalize_locations=bool(st.session_state.get("normalize_locations", False)),
+        geocode_user_agent=st.session_state.get("nominatim_user_agent", "").strip(),
+        guidance_target_type=st.session_state.get("guidance_target_type", "auto"),
+        guidance_soft_prefer=True,
         on_status=status_text.text if status_text else None,
         on_progress=progress_bar.progress if progress_bar else None,
         on_notice=st.info,
@@ -1523,7 +1567,6 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
     )
     
     # Step 1: Aggressive pre-filtering and deduplication
-    st.info("🔍 Pre-filtering and deduplicating responses...")
     
     # Pre-filter obvious non-answers and very short responses, but keep track of filtered ones
     filtered_rows = []
@@ -1589,7 +1632,7 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
     
     if total_tokens <= 500000:  # GPT-5 safe token limit
         # Single request for unique responses
-        st.info(f"🚀 Using single request mode for {len(unique_rows_for_ai)} unique responses ({total_tokens:,} tokens)")
+        
         theme_json = json.dumps(slim_theme_for_assignment(theme_dict))
         allowed_ids = allowed_subtheme_ids(theme_dict)
         schema = make_assignments_schema(allowed_ids, max_codes if allow_multicode else 1)
@@ -1597,9 +1640,7 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
         responses_json = json.dumps(unique_rows_for_ai, separators=(",", ":"))
         
         # Debug: Show theme structure
-        st.info(f"🔍 Debug: Theme dictionary has {len(theme_dict.get('major_themes', []))} major themes")
-        for i, major in enumerate(theme_dict.get('major_themes', [])[:2]):  # Show first 2
-            st.info(f"   Major {i+1}: {major.get('label', 'Unknown')} with {len(major.get('subs', []))} sub-themes")
+        
         
         user = ASSIGNMENT_USER_TEMPLATE.format(max_codes=max_codes, theme_json=theme_json, responses_json=responses_json)
         
@@ -1630,7 +1671,7 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
     else:
         # Process with larger chunks and more aggressive parallel processing
         chunks = chunk_data(unique_rows_for_ai, max_tokens=350000)  # Conservative chunks for GPT-5
-        st.info(f"🚀 Using chunked processing mode: {unique_count} unique responses → {len(chunks)} chunks ({total_tokens:,} tokens)")
+        pass
         
         # Use conservative chunks for GPT-5 quality
         
@@ -1645,7 +1686,7 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
         final_assignments = expanded_assignments + non_answer_assignments
         final_assignments.sort(key=lambda x: x["idx"])  # Sort by original index
         
-        st.success("✅ Assignment complete!")
+        pass
         return final_assignments, total_usage
 
 
@@ -2041,6 +2082,7 @@ def assign_codes_two_stage(
     limiter = get_rate_limiter()
     cache = get_llm_cache()
     cache_stats = get_cache_stats()
+    guidance_text = st.session_state.get(f"question_guidance::{text_col}", "").strip() if "text_col" in globals() else ""
     return pipeline_assign_codes_two_stage(
         client,
         model,
@@ -2056,6 +2098,7 @@ def assign_codes_two_stage(
         cache_stats=cache_stats,
         on_status=status_text.text if status_text else None,
         on_progress=progress_bar.progress if progress_bar else None,
+        guidance_text=guidance_text,
     )
 
 
@@ -2124,7 +2167,9 @@ def verify_low_confidence(
         """Process a single chunk of flagged responses"""
         theme_json = json.dumps(slim_theme_for_assignment(theme_dict))
         flagged_json = json.dumps(chunk_flagged)
-        user = VERIFY_USER_TEMPLATE.format(low_thresh=low_thresh, theme_json=theme_json, flagged_json=flagged_json)
+        guidance_text = st.session_state.get(f"question_guidance::{text_col}", "").strip() if "text_col" in globals() else ""
+        guidance_block = f"\n\nGuidance (must follow):\n{guidance_text}\n" if guidance_text else ""
+        user = VERIFY_USER_TEMPLATE.format(low_thresh=low_thresh, theme_json=theme_json, flagged_json=flagged_json) + guidance_block
         
         def make_request():
             return oai_json_completion(client, model, VERIFY_SYSTEM, user, seed, schema)
@@ -2551,11 +2596,7 @@ with st.sidebar:
     st.header("Settings")
     model = "gpt-5"
     seed = 42  # Hard-coded for deterministic results
-    st.info("🤖 **High Quality Mode: GPT-5 for All Steps**")
-    st.caption("🎯 **Theme Generation**: GPT-5 (highest quality)")
-    st.caption("🎯 **Assignment**: GPT-5 (highest accuracy)")
-    st.caption("💡 GPT-5: 500K TPM, 500 RPM - optimized for cost efficiency")
-    st.caption("🔒 Reproducibility is best-effort (seed + backend changes can still vary outputs)")
+    st.info("Current Mode: GPT-5 for All Steps")
     redact_pii_enabled = True
     allow_multicode = st.toggle("Multi‑coding", value=True)
 
@@ -2663,7 +2704,12 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.write("**Choose theme source:**")
 with col2:
-    theme_source = st.radio("Theme source", ["Generate new themes", "Upload existing themes"], horizontal=True, label_visibility="collapsed")
+    theme_source = st.radio(
+        "Theme source",
+        ["Generate new themes", "Upload existing themes", "Add coding context"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
 # Theme upload functionality
 if theme_source == "Upload existing themes":
@@ -2742,8 +2788,109 @@ if theme_source == "Upload existing themes":
                 st.session_state.pop(k, None)
             st.rerun()
 
+# Guidance input section
+guidance_key = f"question_guidance::{text_col}"
+if theme_source == "Add coding context":
+    st.write("**Provide guidance for theme generation and/or assignment:**")
+    guidance_text = st.text_area(
+        "Coding guidance",
+        value=st.session_state.get(guidance_key, ""),
+        help="Add question-level rules or constraints (e.g., classify only US destinations).",
+        height=120,
+    )
+    if guidance_text.strip():
+        st.session_state[guidance_key] = guidance_text.strip()
+        st.success("Guidance saved for this question.")
+    else:
+        st.warning("Guidance is empty; no additional rules will be applied.")
+
+    st.write("**Target type (optional):**")
+    target_options = {
+        "Auto (from guidance)": "auto",
+        "City/area": "city",
+        "Country": "country",
+        "US state": "state",
+        "Brand": "brand",
+        "Destination": "destination",
+        "Adjective/descriptor": "adjective",
+        "One-word response": "one_word",
+    }
+    selected_label = st.selectbox(
+        "Target type",
+        list(target_options.keys()),
+        index=0,
+    )
+    st.session_state["guidance_target_type"] = target_options[selected_label]
+
+    st.write("**Location normalization (Nominatim):**")
+    normalize_locations = st.checkbox(
+        "Normalize city/area labels using external lookup",
+        value=bool(st.session_state.get("normalize_locations", True)),
+        help="Uses OpenStreetMap Nominatim to standardize labels (e.g., City, ST).",
+        key="normalize_locations",
+    )
+    if normalize_locations:
+        default_ua = ""
+        try:
+            default_ua = st.secrets.get("NOMINATIM_USER_AGENT", "")
+        except Exception:
+            default_ua = ""
+        if not default_ua:
+            default_ua = os.getenv("NOMINATIM_USER_AGENT", "OpenEndCoding/1.0 (contact: local)")
+        st.session_state["nominatim_user_agent"] = st.text_input(
+            "Nominatim User-Agent",
+            value=st.session_state.get("nominatim_user_agent", default_ua),
+            help="Required by Nominatim. Provide a descriptive User-Agent.",
+        )
+        if not (st.session_state.get("nominatim_user_agent", "").strip()):
+            st.warning("Nominatim User-Agent is required; external normalization will be skipped.")
+
+active_guidance = st.session_state.get(guidance_key, "").strip()
+if active_guidance:
+    st.caption(f"**Active guidance:** {active_guidance}")
+    # #region agent log
+    try:
+        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": "H1",
+                "location": "app_v1.py:guidance:active",
+                "message": "Active guidance set",
+                "data": {"guidance_len": len(active_guidance)},
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+if theme_source == "Add coding context":
+    run_settings["normalize_locations"] = bool(st.session_state.get("normalize_locations", False))
+    run_settings["geocode_provider"] = "nominatim" if run_settings["normalize_locations"] else "none"
+    run_settings["guidance_target_type"] = st.session_state.get("guidance_target_type", "auto")
+    run_id = compute_run_id(dataset_sig, model, seed, prompt_versions, run_settings)
+    st.session_state["run_id"] = run_id
+
 # Theme generation section
-if theme_source == "Generate new themes":
+show_generate = theme_source == "Generate new themes" or (
+    theme_source == "Add coding context" and bool(active_guidance)
+)
+if show_generate:
+    # #region agent log
+    try:
+        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": "H2",
+                "location": "app_v1.py:theme_gen:entry",
+                "message": "Theme generation section visible",
+                "data": {"show_generate": True, "guidance_len": len(active_guidance or "")},
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+    # #endregion
     # Cost estimation before generation
     pricing_table = {
         "gpt-5": {"prompt_per_1k": 0.005, "completion_per_1k": 0.015},  # Estimated pricing
@@ -2764,24 +2911,27 @@ if theme_source == "Generate new themes":
     estimated_prompt_tokens = estimate_tokens(json.dumps(filtered_for_estimation))
     estimated_completion_tokens = 2000  # Rough estimate for theme generation
     
-    # If chunking will be needed, estimate for multiple requests
-    if estimated_prompt_tokens > 400000:
-        num_chunks = math.ceil(estimated_prompt_tokens / 350000)
-        estimated_cost = fmt_cost(estimated_prompt_tokens, estimated_completion_tokens * num_chunks, pricing)
-        st.info(f"**Estimated cost for theme generation (GPT-5):** ${estimated_cost:.4f} (will process in {num_chunks} chunks, {len(unique_texts)} unique responses)")
-    else:
-        estimated_cost = fmt_cost(estimated_prompt_tokens, estimated_completion_tokens, pricing)
-        st.info(f"**Estimated cost for theme generation (GPT-5):** ${estimated_cost:.4f} (based on {len(unique_texts)} unique responses)")
-    
-    if estimated_prompt_tokens > 400000:
-        st.markdown("""
-        <div class="warning-box">
-            <h4>⚠️ Very Large Dataset Detected</h4>
-            <p>Your dataset exceeds 400K tokens and will be processed in chunks. With GPT-5's 500K TPM limit, this ensures optimal processing.</p>
-        </div>
-        """, unsafe_allow_html=True)
+    # Keep estimation internal; no extra UI noise
 
     if st.button("Process Themes", type="primary"):
+        # #region agent log
+        try:
+            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H3",
+                    "location": "app_v1.py:theme_gen:click",
+                    "message": "Process Themes clicked",
+                    "data": {
+                        "guidance_len": len(st.session_state.get(guidance_key, "") or ""),
+                        "theme_source": theme_source,
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
         # Start the overall timer
         overall_start_time = time.time()
         
@@ -2824,12 +2974,7 @@ if theme_source == "Generate new themes":
             # Detect question type for optimized theme generation
             question_context = detect_question_type(question_text) if question_text else {"type": "general", "focus": "General analysis", "priority_themes": []}
             
-            # Display question type insights
-            if question_context["type"] != "general":
-                st.info(f"🎯 **Question Type Detected**: {question_context['type'].replace('_', ' ').title()}")
-                st.caption(f"**Focus**: {question_context['focus']}")
-                if question_context['priority_themes']:
-                    st.caption(f"**Priority Themes**: {', '.join(question_context['priority_themes'])}")
+            # Display question type insights only in logs
             
             theme_dict, usage_theme = build_theme_frame_with_progress(
                 client,
@@ -2855,9 +3000,9 @@ if theme_source == "Generate new themes":
                 usage_theme["prompt_tokens"] += usage_gov.get("prompt_tokens", 0)
                 usage_theme["completion_tokens"] += usage_gov.get("completion_tokens", 0)
                 if change_log:
-                    st.info(f"✅ Theme governance applied with {len(change_log)} logged changes.")
+                    pass
                 else:
-                    st.caption("Theme governance applied: no overlaps or granularity issues detected.")
+                    pass
             except Exception as e:
                 st.error(f"Theme governance failed: {str(e)}")
                 st.stop()
@@ -3036,10 +3181,7 @@ with col2:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         help="Download theme dictionary as XLSX for easy import back into the tool"
     )
-
-st.caption("💡 **Tip**: Use these exports to save your themes and import them later using the 'Upload existing themes' option!")
-
-
+# (tip removed for cleaner UI)
 # Comprehensive export (themes + coded data)
 st.write("**Complete Export (Themes + Coded Data):**")
 comprehensive_buf = io.BytesIO()
@@ -3291,7 +3433,7 @@ if flagged:
 
                         # Offer to re-assign with new themes
                         if st.button("🔄 Re-assign All Responses with New Themes", type="primary"):
-                            st.info("Re-assigning all responses with the expanded theme dictionary...")
+                            pass
                             # This would trigger a re-assignment - for now just show a message
                             st.success("Theme dictionary updated! Consider re-running the assignment process to use the new themes.")
                         st.rerun()
@@ -3300,7 +3442,7 @@ if flagged:
 
             with col4:
                 if st.button("🤖 AI Suggest Themes", type="secondary"):
-                    st.info("🤖 AI theme suggestion feature coming soon! For now, use the pattern analysis above to manually create themes.")
+                    pass
 
     if not st.session_state.get("_auto_verified"):
         with st.spinner("Auto re-checking low confidence assignments..."):
@@ -3524,7 +3666,7 @@ else:
 # Theme distribution analysis using tiny_threshold
 st.write("**Theme Distribution Analysis**")
 theme_analysis = analyze_theme_distribution(coded_df, tiny_threshold, st.session_state.get("theme_dict"))
-st.caption(f"Auto tiny-theme threshold: {tiny_threshold:.2f}% based on assignment distribution.")
+pass
 if dynamic_thresholds.get("recommendations"):
     for rec in dynamic_thresholds["recommendations"]:
         st.caption(f"• {rec}")
@@ -3585,6 +3727,8 @@ theme_params = {
     "prompt_versions": prompt_versions,
 }
 assignment_params = run_settings.copy()
+assignment_params["guidance_text"] = active_guidance
+theme_params["guidance_text"] = active_guidance
 
 run_audit = build_run_audit(
     run_id=st.session_state.get("run_id", ""),
@@ -3671,4 +3815,4 @@ if total_usage["prompt_tokens"] > 0 or total_usage["completion_tokens"] > 0:
         f"Cache hits: {cache_stats.hits} | misses: {cache_stats.misses} | "
         f"saved tokens: {cache_stats.saved_prompt_tokens + cache_stats.saved_completion_tokens}"
     )
-    st.caption("Cost estimates based on current OpenAI pricing. High quality mode prioritizes accuracy over cost.")
+    pass

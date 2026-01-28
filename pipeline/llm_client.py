@@ -212,6 +212,28 @@ def oai_json_completion(
 
     cached = cache.get(cache_key)
     if cached is not None:
+        # #region agent log
+        try:
+            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H7",
+                    "location": "pipeline/llm_client.py:oai_json_completion:cache_hit",
+                    "message": "Cache hit",
+                    "data": {
+                        "model": model,
+                        "prompt_version": prompt_version,
+                        "user_len": len(user),
+                        "has_guidance": ("GUIDANCE:" in user) or ("Guidance (must follow):" in user),
+                        "has_weighted_responses": "Weighted responses" in user,
+                        "has_candidate_list": "Candidate sub-themes" in user,
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }) + "\n")
+        except Exception:
+            pass
+        # #endregion
         cache_stats.hits += 1
         usage = cached.get("usage") or {}
         cache_stats.saved_prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
@@ -219,6 +241,28 @@ def oai_json_completion(
         return cached.get("parsed_json") or {}, usage, cached.get("raw_text") or "", True
 
     cache_stats.misses += 1
+    # #region agent log
+    try:
+        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": "H8",
+                "location": "pipeline/llm_client.py:oai_json_completion:cache_miss",
+                "message": "Cache miss",
+                "data": {
+                    "model": model,
+                    "prompt_version": prompt_version,
+                    "user_len": len(user),
+                    "has_guidance": ("GUIDANCE:" in user) or ("Guidance (must follow):" in user),
+                    "has_weighted_responses": "Weighted responses" in user,
+                    "has_candidate_list": "Candidate sub-themes" in user,
+                },
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+    # #endregion
 
     schema_str = ""
     if response_schema:

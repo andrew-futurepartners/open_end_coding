@@ -59,6 +59,9 @@ Return JSON in this exact format:
 Candidate sub-themes:
 {candidate_json}
 
+Guidance (must follow):
+{guidance_text}
+
 Responses:
 {responses_json}
 """
@@ -116,6 +119,7 @@ def assign_codes_two_stage(
     cache_stats: CacheStats,
     on_status: Callable[[str], None] | None = None,
     on_progress: Callable[[int], None] | None = None,
+    guidance_text: str | None = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     def status(msg: str) -> None:
         if on_status:
@@ -127,6 +131,24 @@ def assign_codes_two_stage(
 
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "embedding_tokens": 0}
     status("Preparing two-stage assignment...")
+    # #region agent log
+    try:
+        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": "H4",
+                "location": "pipeline/assignment.py:assign_codes_two_stage:entry",
+                "message": "Assignment entry",
+                "data": {
+                    "rows": len(rows or []),
+                    "guidance_len": len((guidance_text or "").strip()),
+                },
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+    # #endregion
     progress(5)
 
     theme_dict = ensure_nonanswer_theme(theme_dict)
@@ -259,8 +281,28 @@ def assign_codes_two_stage(
                     max_codes=max_codes,
                     low_thresh=low_thresh,
                     candidate_json=candidate_json,
+                    guidance_text=(guidance_text or "None"),
                     responses_json=responses_json,
                 )
+                # #region agent log
+                try:
+                    with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "sessionId": "debug-session",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H5",
+                            "location": "pipeline/assignment.py:assign_codes_two_stage:prompt",
+                            "message": "Assignment prompt built",
+                            "data": {
+                                "candidate_count": len(candidate_ids),
+                                "guidance_len": len((guidance_text or "").strip()),
+                                "prompt_len": len(user),
+                            },
+                            "timestamp": int(time.time() * 1000),
+                        }) + "\n")
+                except Exception:
+                    pass
+                # #endregion
 
                 def make_request():
                     return oai_json_completion(
