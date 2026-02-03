@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from typing import Any, Dict, List, Tuple, Callable
 
 import numpy as np
@@ -121,6 +123,27 @@ def assign_codes_two_stage(
     on_progress: Callable[[int], None] | None = None,
     guidance_text: str | None = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    debug_enabled = os.getenv("ASSIGNMENT_DEBUG_LOG", "").lower() in ("1", "true", "yes")
+    debug_buffer: List[Dict[str, Any]] = []
+
+    def flush_debug() -> None:
+        if not debug_enabled or not debug_buffer:
+            return
+        try:
+            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                for event in debug_buffer:
+                    f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            debug_buffer.clear()
+        except Exception:
+            debug_buffer.clear()
+
+    def record_debug(event: Dict[str, Any]) -> None:
+        if not debug_enabled:
+            return
+        debug_buffer.append(event)
+        if len(debug_buffer) >= 25:
+            flush_debug()
+
     def status(msg: str) -> None:
         if on_status:
             on_status(msg)
@@ -132,22 +155,18 @@ def assign_codes_two_stage(
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "embedding_tokens": 0}
     status("Preparing two-stage assignment...")
     # #region agent log
-    try:
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H4",
-                "location": "pipeline/assignment.py:assign_codes_two_stage:entry",
-                "message": "Assignment entry",
-                "data": {
-                    "rows": len(rows or []),
-                    "guidance_len": len((guidance_text or "").strip()),
-                },
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
+    record_debug({
+        "sessionId": "debug-session",
+        "runId": "pre-fix",
+        "hypothesisId": "H4",
+        "location": "pipeline/assignment.py:assign_codes_two_stage:entry",
+        "message": "Assignment entry",
+        "data": {
+            "rows": len(rows or []),
+            "guidance_len": len((guidance_text or "").strip()),
+        },
+        "timestamp": int(time.time() * 1000),
+    })
     # #endregion
     progress(5)
 
@@ -208,6 +227,23 @@ def assign_codes_two_stage(
         else:
             substantive_texts.append(text)
 
+    # #region agent log
+    targets = [t for t in substantive_texts if "orange county" in (t or "").lower()]
+    if targets:
+        record_debug({
+            "sessionId": "debug-session",
+            "runId": "pre-fix",
+            "hypothesisId": "H26",
+            "location": "pipeline/assignment.py:assign_codes_two_stage:targets",
+            "message": "Target texts for assignment",
+            "data": {
+                "texts": targets[:3],
+                "target_count": len(targets),
+            },
+            "timestamp": int(time.time() * 1000),
+        })
+    # #endregion
+
     if substantive_texts:
         status("Building candidate shortlist (embeddings)...")
         progress(20)
@@ -237,6 +273,21 @@ def assign_codes_two_stage(
             if not normalized_candidates:
                 normalized_candidates = [default_nonanswer_id] if default_nonanswer_id else []
             text_to_assignment[text] = {"candidate_ids": normalized_candidates}
+            # #region agent log
+            if "orange county" in (text or "").lower():
+                record_debug({
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H27",
+                    "location": "pipeline/assignment.py:assign_codes_two_stage:candidates",
+                    "message": "Candidate shortlist for target",
+                    "data": {
+                        "text": text,
+                        "candidate_ids": normalized_candidates[:8],
+                    },
+                    "timestamp": int(time.time() * 1000),
+                })
+            # #endregion
 
     if substantive_texts:
         status("Assigning with candidate-only prompts...")
@@ -252,7 +303,9 @@ def assign_codes_two_stage(
         total_groups = max(1, len(candidate_group))
         subtheme_by_id = {r["id"]: r for r in subtheme_records}
 
-        for candidate_key, texts_in_group in candidate_group.items():
+        guidance_value = guidance_text or "None"
+
+        for group_index, (candidate_key, texts_in_group) in enumerate(candidate_group.items(), start=1):
             candidate_ids = list(candidate_key) or [default_nonanswer_id or (all_subtheme_ids[0] if all_subtheme_ids else "T999.5")]
             candidate_payload = [
                 {
@@ -265,6 +318,13 @@ def assign_codes_two_stage(
             ]
 
             candidate_json = json.dumps(candidate_payload, ensure_ascii=False, separators=(",", ":"))
+            user_prefix = ASSIGNMENT_STAGE2_USER_TEMPLATE.format(
+                max_codes=max_codes,
+                low_thresh=low_thresh,
+                candidate_json=candidate_json,
+                guidance_text=guidance_value,
+                responses_json="__RESPONSES__",
+            )
 
             response_items = [{"idx": i, "text": t} for i, t in enumerate(texts_in_group)]
             candidate_tokens = estimate_tokens(candidate_json, model=model)
@@ -275,33 +335,23 @@ def assign_codes_two_stage(
 
             schema = make_assignment_decision_schema(candidate_ids, max_codes=max_codes)
 
-            for chunk in response_chunks:
+            for chunk_index, chunk in enumerate(response_chunks, start=1):
                 responses_json = json.dumps(chunk, ensure_ascii=False, separators=(",", ":"))
-                user = ASSIGNMENT_STAGE2_USER_TEMPLATE.format(
-                    max_codes=max_codes,
-                    low_thresh=low_thresh,
-                    candidate_json=candidate_json,
-                    guidance_text=(guidance_text or "None"),
-                    responses_json=responses_json,
-                )
+                user = user_prefix.replace("__RESPONSES__", responses_json)
                 # #region agent log
-                try:
-                    with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-                        f.write(json.dumps({
-                            "sessionId": "debug-session",
-                            "runId": "pre-fix",
-                            "hypothesisId": "H5",
-                            "location": "pipeline/assignment.py:assign_codes_two_stage:prompt",
-                            "message": "Assignment prompt built",
-                            "data": {
-                                "candidate_count": len(candidate_ids),
-                                "guidance_len": len((guidance_text or "").strip()),
-                                "prompt_len": len(user),
-                            },
-                            "timestamp": int(time.time() * 1000),
-                        }) + "\n")
-                except Exception:
-                    pass
+                record_debug({
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H5",
+                    "location": "pipeline/assignment.py:assign_codes_two_stage:prompt",
+                    "message": "Assignment prompt built",
+                    "data": {
+                        "candidate_count": len(candidate_ids),
+                        "guidance_len": len(guidance_value.strip()),
+                        "prompt_len": len(user),
+                    },
+                    "timestamp": int(time.time() * 1000),
+                })
                 # #endregion
 
                 def make_request():
@@ -321,7 +371,28 @@ def assign_codes_two_stage(
                     )
 
                 try:
-                    data, usage, raw, _ = retry_with_backoff(make_request)
+                    hits_before = cache_stats.hits
+                    misses_before = cache_stats.misses
+                    call_start = time.perf_counter()
+                    data, usage, raw, cached = retry_with_backoff(make_request)
+                    elapsed_ms = int((time.perf_counter() - call_start) * 1000)
+                    record_debug({
+                        "sessionId": "debug-session",
+                        "runId": "pre-fix",
+                        "hypothesisId": "H5a",
+                        "location": "pipeline/assignment.py:assign_codes_two_stage:llm_call",
+                        "message": "Assignment LLM call metrics",
+                        "data": {
+                            "group_index": group_index,
+                            "chunk_index": chunk_index,
+                            "chunk_size": len(chunk),
+                            "elapsed_ms": elapsed_ms,
+                            "cache_hit": bool(cached),
+                            "cache_hits_delta": cache_stats.hits - hits_before,
+                            "cache_misses_delta": cache_stats.misses - misses_before,
+                        },
+                        "timestamp": int(time.time() * 1000),
+                    })
                 except JsonParseError as e:
                     data, usage, raw = repair_json_to_schema(
                         client,
@@ -369,6 +440,23 @@ def assign_codes_two_stage(
                         low_thresh,
                     )
                     text_to_assignment[text].update(normalized)
+                    # #region agent log
+                    if "orange county" in (text or "").lower():
+                        record_debug({
+                            "sessionId": "debug-session",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H28",
+                            "location": "pipeline/assignment.py:assign_codes_two_stage:result",
+                            "message": "Assignment result for target",
+                            "data": {
+                                "text": text,
+                                "subtheme_ids": normalized.get("subtheme_ids", []),
+                                "decision": normalized.get("decision"),
+                                "confidence": normalized.get("confidence"),
+                            },
+                            "timestamp": int(time.time() * 1000),
+                        })
+                    # #endregion
 
             completed_groups += 1
             progress(40 + int((completed_groups / total_groups) * 50))
@@ -405,4 +493,5 @@ def assign_codes_two_stage(
     all_assignments.sort(key=lambda x: x["idx"])
     status("Assignment complete!")
     progress(100)
+    flush_debug()
     return all_assignments, total_usage

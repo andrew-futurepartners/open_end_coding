@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
@@ -100,33 +101,75 @@ def compute_prompt_version(system: str, user: str) -> str:
     return _hash_text(system + "\n" + user)
 
 
+_DEBUG_LOG_ENABLED = os.getenv("LLM_DEBUG_LOG", "").lower() in ("1", "true", "yes")
+_DEBUG_BUFFER: list[dict[str, Any]] = []
+_DEBUG_BUFFER_LOCK = threading.Lock()
+
+
+def _flush_debug_buffer() -> None:
+    if not _DEBUG_LOG_ENABLED:
+        return
+    with _DEBUG_BUFFER_LOCK:
+        if not _DEBUG_BUFFER:
+            return
+        try:
+            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                for event in _DEBUG_BUFFER:
+                    f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        finally:
+            _DEBUG_BUFFER.clear()
+
+
+def _log_debug_event(event: Dict[str, Any]) -> None:
+    if not _DEBUG_LOG_ENABLED:
+        return
+    with _DEBUG_BUFFER_LOCK:
+        _DEBUG_BUFFER.append(event)
+        if len(_DEBUG_BUFFER) >= 50:
+            _flush_debug_buffer()
+
+
+atexit.register(_flush_debug_buffer)
+
+
 class SQLiteCache:
     def __init__(self, path: str):
         self.path = path
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self._lock = threading.Lock()
+        self._local = threading.local()
         self._init_db()
 
     def _init_db(self) -> None:
-        with sqlite3.connect(self.path) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS llm_cache (
-                    cache_key TEXT PRIMARY KEY,
-                    model TEXT,
-                    prompt_version TEXT,
-                    created_at REAL,
-                    raw_text TEXT,
-                    parsed_json TEXT,
-                    usage_json TEXT,
-                    retry_json TEXT
-                )
-                """
+        conn = self._get_conn()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_cache (
+                cache_key TEXT PRIMARY KEY,
+                model TEXT,
+                prompt_version TEXT,
+                created_at REAL,
+                raw_text TEXT,
+                parsed_json TEXT,
+                usage_json TEXT,
+                retry_json TEXT
             )
-            conn.commit()
+            """
+        )
+        conn.commit()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path)
+            self._local.conn = conn
+        return conn
 
     def get(self, cache_key: str) -> Dict[str, Any] | None:
-        with self._lock, sqlite3.connect(self.path) as conn:
+        with self._lock:
+            conn = self._get_conn()
             cur = conn.execute(
                 "SELECT raw_text, parsed_json, usage_json FROM llm_cache WHERE cache_key = ?",
                 (cache_key,),
@@ -143,7 +186,8 @@ class SQLiteCache:
 
     def set(self, cache_key: str, model: str, prompt_version: str, raw_text: str, parsed: Dict[str, Any],
             usage: Dict[str, Any], retry_meta: Dict[str, Any] | None = None) -> None:
-        with self._lock, sqlite3.connect(self.path) as conn:
+        with self._lock:
+            conn = self._get_conn()
             conn.execute(
                 """
                 INSERT OR REPLACE INTO llm_cache
@@ -213,26 +257,22 @@ def oai_json_completion(
     cached = cache.get(cache_key)
     if cached is not None:
         # #region agent log
-        try:
-            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "sessionId": "debug-session",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H7",
-                    "location": "pipeline/llm_client.py:oai_json_completion:cache_hit",
-                    "message": "Cache hit",
-                    "data": {
-                        "model": model,
-                        "prompt_version": prompt_version,
-                        "user_len": len(user),
-                        "has_guidance": ("GUIDANCE:" in user) or ("Guidance (must follow):" in user),
-                        "has_weighted_responses": "Weighted responses" in user,
-                        "has_candidate_list": "Candidate sub-themes" in user,
-                    },
-                    "timestamp": int(time.time() * 1000),
-                }) + "\n")
-        except Exception:
-            pass
+        _log_debug_event({
+            "sessionId": "debug-session",
+            "runId": "pre-fix",
+            "hypothesisId": "H7",
+            "location": "pipeline/llm_client.py:oai_json_completion:cache_hit",
+            "message": "Cache hit",
+            "data": {
+                "model": model,
+                "prompt_version": prompt_version,
+                "user_len": len(user),
+                "has_guidance": ("GUIDANCE:" in user) or ("Guidance (must follow):" in user),
+                "has_weighted_responses": "Weighted responses" in user,
+                "has_candidate_list": "Candidate sub-themes" in user,
+            },
+            "timestamp": int(time.time() * 1000),
+        })
         # #endregion
         cache_stats.hits += 1
         usage = cached.get("usage") or {}
@@ -242,26 +282,22 @@ def oai_json_completion(
 
     cache_stats.misses += 1
     # #region agent log
-    try:
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H8",
-                "location": "pipeline/llm_client.py:oai_json_completion:cache_miss",
-                "message": "Cache miss",
-                "data": {
-                    "model": model,
-                    "prompt_version": prompt_version,
-                    "user_len": len(user),
-                    "has_guidance": ("GUIDANCE:" in user) or ("Guidance (must follow):" in user),
-                    "has_weighted_responses": "Weighted responses" in user,
-                    "has_candidate_list": "Candidate sub-themes" in user,
-                },
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
+    _log_debug_event({
+        "sessionId": "debug-session",
+        "runId": "pre-fix",
+        "hypothesisId": "H8",
+        "location": "pipeline/llm_client.py:oai_json_completion:cache_miss",
+        "message": "Cache miss",
+        "data": {
+            "model": model,
+            "prompt_version": prompt_version,
+            "user_len": len(user),
+            "has_guidance": ("GUIDANCE:" in user) or ("Guidance (must follow):" in user),
+            "has_weighted_responses": "Weighted responses" in user,
+            "has_candidate_list": "Candidate sub-themes" in user,
+        },
+        "timestamp": int(time.time() * 1000),
+    })
     # #endregion
 
     schema_str = ""

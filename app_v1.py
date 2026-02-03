@@ -1309,7 +1309,7 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
                 "timestamp": int(time.time() * 1000),
             }) + "\n")
     except Exception:
-        
+        pass
     # #endregion
     # #region agent log
     try:
@@ -1329,7 +1329,7 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
                 "timestamp": int(time.time() * 1000),
             }) + "\n")
     except Exception:
-        
+        pass
     # #endregion
 
     return pipeline_build_theme_frame_with_progress(
@@ -1671,7 +1671,6 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
     else:
         # Process with larger chunks and more aggressive parallel processing
         chunks = chunk_data(unique_rows_for_ai, max_tokens=350000)  # Conservative chunks for GPT-5
-        pass
         
         # Use conservative chunks for GPT-5 quality
         
@@ -1685,8 +1684,6 @@ def assign_codes(client: OpenAI, model: str, theme_dict: Dict[str, Any], rows: L
         # Add back the non-answer assignments for filtered responses
         final_assignments = expanded_assignments + non_answer_assignments
         final_assignments.sort(key=lambda x: x["idx"])  # Sort by original index
-        
-        pass
         return final_assignments, total_usage
 
 
@@ -2594,9 +2591,9 @@ st.markdown("""
 
 with st.sidebar:
     st.header("Settings")
-    model = "gpt-5"
+    model = "gpt-5.2"
     seed = 42  # Hard-coded for deterministic results
-    st.info("Current Mode: GPT-5 for All Steps")
+    st.info("Current Mode: GPT-5.2 for All Steps")
     redact_pii_enabled = True
     allow_multicode = st.toggle("Multi‑coding", value=True)
 
@@ -2807,7 +2804,9 @@ if theme_source == "Add coding context":
     st.write("**Target type (optional):**")
     target_options = {
         "Auto (from guidance)": "auto",
-        "City/area": "city",
+        "Location (catch-all)": "location",
+        "City (strict)": "city",
+        "County": "county",
         "Country": "country",
         "US state": "state",
         "Brand": "brand",
@@ -2893,6 +2892,7 @@ if show_generate:
     # #endregion
     # Cost estimation before generation
     pricing_table = {
+        "gpt-5.2": {"prompt_per_1k": 0.005, "completion_per_1k": 0.015},  # Estimated pricing
         "gpt-5": {"prompt_per_1k": 0.005, "completion_per_1k": 0.015},  # Estimated pricing
         "gpt-4o": {"prompt_per_1k": 0.005, "completion_per_1k": 0.015},
         "gpt-4o-mini": {"prompt_per_1k": 0.0005, "completion_per_1k": 0.0015},
@@ -2939,20 +2939,6 @@ if show_generate:
         progress_container = st.container()
         status_container = st.container()
         
-        # Create timer display
-        timer_container = st.container()
-        with timer_container:
-            st.markdown("### ⏱️ Processing Timer")
-            timer_col1, timer_col2, timer_col3, timer_col4 = st.columns(4)
-            with timer_col1:
-                total_timer = st.empty()
-            with timer_col2:
-                theme_timer = st.empty()
-            with timer_col3:
-                assign_timer = st.empty()
-            with timer_col4:
-                build_timer = st.empty()
-        
         with progress_container:
             st.subheader("Processing Progress")
             
@@ -2964,12 +2950,6 @@ if show_generate:
             theme_start_time = time.time()
             theme_status.text("Initializing theme generation...")
             theme_progress.progress(10)
-            
-            # Update timer display
-            total_timer.metric("⏱️ Total Time", "0:00")
-            theme_timer.metric("🎯 Theme Gen", "Running...")
-            assign_timer.metric("🏷️ Assignment", "Waiting...")
-            build_timer.metric("📊 Building", "Waiting...")
             
             # Detect question type for optimized theme generation
             question_context = detect_question_type(question_text) if question_text else {"type": "general", "focus": "General analysis", "priority_themes": []}
@@ -2999,10 +2979,6 @@ if show_generate:
                 st.session_state["theme_governance_log"] = change_log
                 usage_theme["prompt_tokens"] += usage_gov.get("prompt_tokens", 0)
                 usage_theme["completion_tokens"] += usage_gov.get("completion_tokens", 0)
-                if change_log:
-                    pass
-                else:
-                    pass
             except Exception as e:
                 st.error(f"Theme governance failed: {str(e)}")
                 st.stop()
@@ -3019,11 +2995,6 @@ if show_generate:
             theme_progress.progress(100)
             theme_status.text("✅ Theme generation complete!")
             
-            # Update timers
-            total_elapsed = time.time() - overall_start_time
-            total_timer.metric("⏱️ Total Time", f"{int(total_elapsed//60)}:{int(total_elapsed%60):02d}")
-            theme_timer.metric("🎯 Theme Gen", f"{int(theme_duration//60)}:{int(theme_duration%60):02d}")
-            
             # Step 2: Assign themes with progress
             st.write("🏷️ **Assigning Themes to Responses**")
             assign_progress = st.progress(0)
@@ -3032,9 +3003,6 @@ if show_generate:
             assign_start_time = time.time()
             assign_status.text("Preparing assignment data...")
             assign_progress.progress(5)
-            
-            # Update timer display
-            assign_timer.metric("🏷️ Assignment", "Running...")
             
             rows_payload = [
                 {"idx": int(i), "text": t}
@@ -3062,11 +3030,6 @@ if show_generate:
             assign_progress.progress(100)
             assign_status.text("✅ Theme assignment complete!")
             
-            # Update timers
-            total_elapsed = time.time() - overall_start_time
-            total_timer.metric("⏱️ Total Time", f"{int(total_elapsed//60)}:{int(total_elapsed%60):02d}")
-            assign_timer.metric("🏷️ Assignment", f"{int(assign_duration//60)}:{int(assign_duration%60):02d}")
-            
             # Step 3: Build coded dataframe
             st.write("📊 **Building Coded Dataset**")
             build_progress = st.progress(0)
@@ -3076,9 +3039,6 @@ if show_generate:
             build_status.text("Processing coded data...")
             build_progress.progress(50)
             
-            # Update timer display
-            build_timer.metric("📊 Building", "Running...")
-            
             # This will be done in the main flow below
             build_progress.progress(100)
             build_status.text("✅ Dataset ready for analysis!")
@@ -3086,31 +3046,7 @@ if show_generate:
             build_end_time = time.time()
             build_duration = build_end_time - build_start_time
             
-            # Final timer update
             total_elapsed = time.time() - overall_start_time
-            total_timer.metric("⏱️ Total Time", f"{int(total_elapsed//60)}:{int(total_elapsed%60):02d}")
-            build_timer.metric("📊 Building", f"{int(build_duration//60)}:{int(build_duration%60):02d}")
-        
-        # Final summary with timing
-        total_minutes = int(total_elapsed // 60)
-        total_seconds = int(total_elapsed % 60)
-        theme_minutes = int(theme_duration // 60)
-        theme_seconds = int(theme_duration % 60)
-        assign_minutes = int(assign_duration // 60)
-        assign_seconds = int(assign_duration % 60)
-        
-        st.markdown(f"""
-        <div class="success-box">
-            <h4>✅ Theme Processing Complete!</h4>
-            <p><strong>⏱️ Total Processing Time: {total_minutes}:{total_seconds:02d}</strong></p>
-            <ul>
-                <li>🎯 Theme Generation: {theme_minutes}:{theme_seconds:02d}</li>
-                <li>🏷️ Theme Assignment: {assign_minutes}:{assign_seconds:02d}</li>
-                <li>📊 Dataset Building: <1 second</li>
-            </ul>
-            <p>Your themes have been generated and assigned to all responses. Review the results below and use the verification tools if needed.</p>
-        </div>
-        """, unsafe_allow_html=True)
 
 if "theme_dict" not in st.session_state or "assigned_raw" not in st.session_state:
     st.stop()
@@ -3272,19 +3208,21 @@ for i in range(len(df)):
         "RowIndex": i,
         f"{question_label}_OE": ser.iloc[i],
         f"{question_label}_MajorTheme1": major_labels_aligned[0] if len(major_labels_aligned) > 0 else "",
-        f"{question_label}_MajorTheme2": major_labels_aligned[1] if len(major_labels_aligned) > 1 else "",
-        f"{question_label}_MajorTheme3": major_labels_aligned[2] if len(major_labels_aligned) > 2 else "",
-        f"{question_label}_MajorTheme1_confidence": confs[0] if len(confs) > 0 else np.nan,
-        f"{question_label}_MajorTheme2_confidence": confs[1] if len(confs) > 1 else np.nan,
-        f"{question_label}_MajorTheme3_confidence": confs[2] if len(confs) > 2 else np.nan,
         f"{question_label}_MinorTheme1": code_labels[0] if len(code_labels) > 0 else "",
-        f"{question_label}_MinorTheme2": code_labels[1] if len(code_labels) > 1 else "",
-        f"{question_label}_MinorTheme3": code_labels[2] if len(code_labels) > 2 else "",
-        f"{question_label}_MinorTheme1_confidence": confs[0] if len(confs) > 0 else np.nan,
-        f"{question_label}_MinorTheme2_confidence": confs[1] if len(confs) > 1 else np.nan,
-        f"{question_label}_MinorTheme3_confidence": confs[2] if len(confs) > 2 else np.nan,
-        "IsMultiCoded": (len(codes) > 1),
+        f"{question_label}_Theme1_Confidence": confs[0] if len(confs) > 0 else np.nan,
     }
+
+    if allow_multicode:
+        row.update({
+            f"{question_label}_MajorTheme2": major_labels_aligned[1] if len(major_labels_aligned) > 1 else "",
+            f"{question_label}_MajorTheme3": major_labels_aligned[2] if len(major_labels_aligned) > 2 else "",
+            f"{question_label}_MinorTheme2": code_labels[1] if len(code_labels) > 1 else "",
+            f"{question_label}_MinorTheme3": code_labels[2] if len(code_labels) > 2 else "",
+            f"{question_label}_Theme2_Confidence": confs[1] if len(confs) > 1 else np.nan,
+            f"{question_label}_Theme3_Confidence": confs[2] if len(confs) > 2 else np.nan,
+        })
+
+    row["IsMultiCoded"] = (len(codes) > 1)
 
     # Carry through IDs
     for c in pass_id_cols:
@@ -3299,19 +3237,26 @@ base_cols = [
     "RowIndex",
     f"{question_label}_OE",
     f"{question_label}_MajorTheme1",
-    f"{question_label}_MajorTheme2",
-    f"{question_label}_MajorTheme3",
-    f"{question_label}_MajorTheme1_confidence",
-    f"{question_label}_MajorTheme2_confidence",
-    f"{question_label}_MajorTheme3_confidence",
     f"{question_label}_MinorTheme1",
-    f"{question_label}_MinorTheme2",
-    f"{question_label}_MinorTheme3",
-    f"{question_label}_MinorTheme1_confidence",
-    f"{question_label}_MinorTheme2_confidence",
-    f"{question_label}_MinorTheme3_confidence",
+    f"{question_label}_Theme1_Confidence",
     "IsMultiCoded",
 ]
+
+if allow_multicode:
+    base_cols = [
+        "RowIndex",
+        f"{question_label}_OE",
+        f"{question_label}_MajorTheme1",
+        f"{question_label}_MajorTheme2",
+        f"{question_label}_MajorTheme3",
+        f"{question_label}_MinorTheme1",
+        f"{question_label}_MinorTheme2",
+        f"{question_label}_MinorTheme3",
+        f"{question_label}_Theme1_Confidence",
+        f"{question_label}_Theme2_Confidence",
+        f"{question_label}_Theme3_Confidence",
+        "IsMultiCoded",
+    ]
 ordered_cols = id_before + base_cols
 coded_df = coded_df[ordered_cols]
 
@@ -3413,7 +3358,7 @@ if flagged:
             new_theme_name = st.text_input("New Theme Name", key="new_theme_name")
             new_theme_definition = st.text_area("Theme Definition", key="new_theme_definition")
 
-            col3, col4 = st.columns(2)
+            col3 = st.columns(1)[0]
             with col3:
                 if st.button("➕ Add New Theme", type="secondary"):
                     if new_theme_name and new_theme_definition:
@@ -3431,18 +3376,9 @@ if flagged:
 
                         st.success(f"✅ Added new {new_theme_type}: {new_theme_name}")
 
-                        # Offer to re-assign with new themes
-                        if st.button("🔄 Re-assign All Responses with New Themes", type="primary"):
-                            pass
-                            # This would trigger a re-assignment - for now just show a message
-                            st.success("Theme dictionary updated! Consider re-running the assignment process to use the new themes.")
                         st.rerun()
                     else:
                         st.error("Please provide both theme name and definition")
-
-            with col4:
-                if st.button("🤖 AI Suggest Themes", type="secondary"):
-                    pass
 
     if not st.session_state.get("_auto_verified"):
         with st.spinner("Auto re-checking low confidence assignments..."):
@@ -3476,8 +3412,6 @@ if flagged:
             st.session_state["_auto_verified"] = True
 
             st.success(f"✅ Auto re-checked {len(verified)} assignments")
-    else:
-        st.caption("Auto-verification already completed for this run.")
 else:
     st.success("✅ All responses have high confidence scores - no review needed!")
 
@@ -3507,11 +3441,14 @@ st.write("**Statistical Summary**")
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    total_responses = len(coded_df)
+    response_series = coded_df[f"{question_label}_OE"]
+    non_empty_mask = response_series.notna() & response_series.astype(str).str.strip().ne("")
+    total_responses = int(non_empty_mask.sum())
     st.metric("Total Responses", f"{total_responses:,}")
 
 with col2:
-    coded_responses = len(coded_df[coded_df[f"{question_label}_MinorTheme1"] != ""])
+    coded_mask = non_empty_mask & coded_df[f"{question_label}_MinorTheme1"].astype(str).str.strip().ne("")
+    coded_responses = int(coded_mask.sum())
     st.metric("Coded Responses", f"{coded_responses:,}")
 
 with col3:
@@ -3519,7 +3456,8 @@ with col3:
     st.metric("Coding Rate", f"{coding_rate:.1f}%")
 
 with col4:
-    avg_confidence = coded_df[f"{question_label}_MinorTheme1_confidence"].mean()
+    avg_confidence = coded_df.loc[coded_mask, f"{question_label}_Theme1_Confidence"].mean()
+    avg_confidence = float(avg_confidence) if coded_responses > 0 else 0.0
     st.metric("Avg Confidence", f"{avg_confidence:.2f}")
 
 # Theme distribution chart with interactive legend
@@ -3666,7 +3604,6 @@ else:
 # Theme distribution analysis using tiny_threshold
 st.write("**Theme Distribution Analysis**")
 theme_analysis = analyze_theme_distribution(coded_df, tiny_threshold, st.session_state.get("theme_dict"))
-pass
 if dynamic_thresholds.get("recommendations"):
     for rec in dynamic_thresholds["recommendations"]:
         st.caption(f"• {rec}")
@@ -3784,6 +3721,7 @@ st.session_state["_usage_totals"] = total_usage
 
 # Pricing table (as of 2024)
 pricing_table = {
+    "gpt-5.2": {"prompt_per_1k": 0.005, "completion_per_1k": 0.015},  # Estimated pricing
     "gpt-5": {"prompt_per_1k": 0.005, "completion_per_1k": 0.015},  # Estimated pricing
     "gpt-4o": {"prompt_per_1k": 0.005, "completion_per_1k": 0.015},
     "gpt-4o-mini": {"prompt_per_1k": 0.0005, "completion_per_1k": 0.0015},
@@ -3815,4 +3753,3 @@ if total_usage["prompt_tokens"] > 0 or total_usage["completion_tokens"] > 0:
         f"Cache hits: {cache_stats.hits} | misses: {cache_stats.misses} | "
         f"saved tokens: {cache_stats.saved_prompt_tokens + cache_stats.saved_completion_tokens}"
     )
-    pass

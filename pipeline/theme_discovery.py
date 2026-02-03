@@ -21,6 +21,8 @@ from pipeline.geocode import (
     GeoRateLimiter,
     get_default_geocode_cache,
     get_default_geocode_limiter,
+    normalize_city,
+    normalize_county,
     normalize_country,
     normalize_location,
     normalize_state,
@@ -168,8 +170,8 @@ def merge_theme_chunks(theme_chunks: List[Dict[str, Any]], on_notice: Callable[[
 def _guidance_expected_tokens(guidance_text: str) -> List[str]:
     text = (guidance_text or "").lower()
     tokens: List[str] = []
-    if any(k in text for k in ["city", "cities", "area", "areas", "location", "region", "state", "country"]):
-        tokens.extend(["city", "area", "location", "region", "state", "country", "neighborhood"])
+    if any(k in text for k in ["city", "cities", "area", "areas", "location", "region", "state", "country", "county"]):
+        tokens.extend(["city", "area", "location", "region", "state", "country", "county", "neighborhood"])
     if "brand" in text or "brands" in text:
         tokens.append("brand")
     if "destination" in text or "destinations" in text:
@@ -195,12 +197,16 @@ def _detect_target_type(guidance_text: str | None) -> str:
         return "country"
     if any(k in text for k in ["state", "states", "us state", "u.s. state"]):
         return "state"
-    if any(k in text for k in ["city", "cities", "area", "areas", "location", "region", "neighborhood", "neighbourhood"]):
-        return "city"
+    if "county" in text or "counties" in text:
+        return "county"
     if any(k in text for k in ["brand", "brands"]):
         return "brand"
     if any(k in text for k in ["destination", "destinations"]):
         return "destination"
+    if any(k in text for k in ["location", "area", "areas", "region", "neighborhood", "neighbourhood"]):
+        return "location"
+    if any(k in text for k in ["city", "cities"]):
+        return "city"
     return "general"
 
 
@@ -299,7 +305,7 @@ def _build_guided_codeframe(
         if not raw:
             continue
         label = ""
-        if target_type in {"city", "state", "country"}:
+        if target_type in {"city", "state", "country", "county", "location"}:
             candidate = _extract_location_candidate(raw)
             if normalize_locations and geocode_user_agent:
                 if target_type == "country":
@@ -311,6 +317,20 @@ def _build_guided_codeframe(
                     )
                 elif target_type == "state":
                     label, _ = normalize_state(
+                        candidate,
+                        user_agent=geocode_user_agent,
+                        cache=geocode_cache,
+                        limiter=geocode_limiter,
+                    )
+                elif target_type == "county":
+                    label, _ = normalize_county(
+                        candidate,
+                        user_agent=geocode_user_agent,
+                        cache=geocode_cache,
+                        limiter=geocode_limiter,
+                    )
+                elif target_type == "city":
+                    label, _ = normalize_city(
                         candidate,
                         user_agent=geocode_user_agent,
                         cache=geocode_cache,
@@ -364,14 +384,22 @@ def _build_guided_codeframe(
             ordered = ordered[:max_subthemes]
     total = sum(cnt for _, cnt in ordered) or 1
 
-    if target_type in {"city", "state", "country"}:
-        major_label = "Locations"
+    if target_type in {"city", "state", "country", "county", "location"}:
         if target_type == "country":
+            major_label = "Countries"
             major_def = "Country categories derived from responses."
         elif target_type == "state":
+            major_label = "States"
             major_def = "State categories derived from responses."
+        elif target_type == "county":
+            major_label = "Counties"
+            major_def = "County categories derived from responses."
+        elif target_type == "city":
+            major_label = "Cities"
+            major_def = "City categories derived from responses."
         else:
-            major_def = "City or area categories derived from responses."
+            major_label = "Locations"
+            major_def = "Location categories derived from responses."
     elif target_type == "brand":
         major_label = "Brands"
         major_def = "Brand categories derived from responses."
