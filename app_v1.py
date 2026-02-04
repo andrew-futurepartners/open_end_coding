@@ -70,6 +70,8 @@ from pipeline.run_audit import build_run_audit, compute_run_id, dataset_signatur
 from pipeline.theme_discovery import (
     THEME_DISCOVERY_SYSTEM as PIPE_THEME_DISCOVERY_SYSTEM,
     THEME_DISCOVERY_USER as PIPE_THEME_DISCOVERY_USER,
+    DESTINATION_NORMALIZE_SYSTEM as PIPE_DESTINATION_NORMALIZE_SYSTEM,
+    DESTINATION_NORMALIZE_USER_TEMPLATE as PIPE_DESTINATION_NORMALIZE_USER_TEMPLATE,
     build_theme_frame_with_progress as pipeline_build_theme_frame_with_progress,
 )
 from pipeline.governance import (
@@ -1154,6 +1156,10 @@ def ensure_nonanswer_theme(theme_dict: Dict[str, Any]) -> Dict[str, Any]:
     Prevents brittle fallbacks and makes non-answer handling auditable.
     """
     majors = theme_dict.get("major_themes", []) or []
+    if isinstance(majors, list):
+        majors = [m for m in majors if isinstance(m, dict)]
+    else:
+        majors = []
 
     def norm(x: str) -> str:
         return re.sub(r"[^a-z]+", "", (x or "").lower())
@@ -1292,45 +1298,12 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
     limiter = get_rate_limiter()
     cache = get_llm_cache()
     cache_stats = get_cache_stats()
-    # #region agent log
-    try:
-        guidance_text = st.session_state.get(f"question_guidance::{text_col}", "").strip() if "text_col" in globals() else ""
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H6",
-                "location": "app_v1.py:build_theme_frame_with_progress:wrapper",
-                "message": "Calling pipeline theme discovery",
-                "data": {
-                    "guidance_len": len(guidance_text),
-                    "text_count": len(texts or []),
-                },
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-    # #endregion
-    # #region agent log
-    try:
-        import sys
-        td_mod = sys.modules.get("pipeline.theme_discovery")
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H15",
-                "location": "app_v1.py:build_theme_frame_with_progress:module",
-                "message": "Theme discovery module info",
-                "data": {
-                    "module_file": getattr(td_mod, "__file__", None),
-                    "module_loaded": td_mod is not None,
-                },
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-    # #endregion
+    normalization_question_text = None
+    if "text_cols" in globals() and text_cols:
+        normalization_question_text = text_cols[0]
+    else:
+        normalization_question_text = question_text if "question_text" in globals() else None
+    normalization_map = st.session_state.get("destination_normalization_map")
 
     return pipeline_build_theme_frame_with_progress(
         client,
@@ -1342,11 +1315,13 @@ def build_theme_frame_with_progress(client: OpenAI, model: str, texts: List[str]
         cache=cache,
         cache_stats=cache_stats,
         question_context=question_context,
-        guidance_text=st.session_state.get(f"question_guidance::{text_col}", "").strip() if "text_col" in globals() else "",
+        guidance_text=st.session_state.get(f"question_guidance::{question_text}", "").strip() if "question_text" in globals() else "",
         normalize_locations=bool(st.session_state.get("normalize_locations", False)),
         geocode_user_agent=st.session_state.get("nominatim_user_agent", "").strip(),
         guidance_target_type=st.session_state.get("guidance_target_type", "auto"),
         guidance_soft_prefer=True,
+        normalization_question_text=normalization_question_text,
+        normalization_map=normalization_map,
         on_status=status_text.text if status_text else None,
         on_progress=progress_bar.progress if progress_bar else None,
         on_notice=st.info,
@@ -2079,7 +2054,7 @@ def assign_codes_two_stage(
     limiter = get_rate_limiter()
     cache = get_llm_cache()
     cache_stats = get_cache_stats()
-    guidance_text = st.session_state.get(f"question_guidance::{text_col}", "").strip() if "text_col" in globals() else ""
+    guidance_text = st.session_state.get(f"question_guidance::{question_text}", "").strip() if "question_text" in globals() else ""
     return pipeline_assign_codes_two_stage(
         client,
         model,
@@ -2164,7 +2139,7 @@ def verify_low_confidence(
         """Process a single chunk of flagged responses"""
         theme_json = json.dumps(slim_theme_for_assignment(theme_dict))
         flagged_json = json.dumps(chunk_flagged)
-        guidance_text = st.session_state.get(f"question_guidance::{text_col}", "").strip() if "text_col" in globals() else ""
+        guidance_text = st.session_state.get(f"question_guidance::{question_text}", "").strip() if "question_text" in globals() else ""
         guidance_block = f"\n\nGuidance (must follow):\n{guidance_text}\n" if guidance_text else ""
         user = VERIFY_USER_TEMPLATE.format(low_thresh=low_thresh, theme_json=theme_json, flagged_json=flagged_json) + guidance_block
         
@@ -2216,15 +2191,20 @@ def verify_low_confidence(
 
 def analyze_theme_distribution(coded_df: pd.DataFrame, tiny_threshold: float, theme_dict: Dict[str, Any] = None) -> Dict[str, Any]:
     """Analyze theme distribution and identify potential issues with outlier handling"""
-    total_responses = len(coded_df)
+    prefixes = [question_label if len(text_cols) == 1 else f"{question_label}_{col}" for col in text_cols]
+    minor_cols = [f"{p}_MinorTheme1" for p in prefixes]
+    oe_cols = [f"{p}_OE" for p in prefixes]
+    minor_series = pd.concat([coded_df[c] for c in minor_cols], ignore_index=True)
+    oe_series = pd.concat([coded_df[c] for c in oe_cols], ignore_index=True)
+    total_responses = int(oe_series.notna().sum())
     
     # Count responses in different categories
-    other_themes = coded_df[coded_df[f"{question_label}_MinorTheme1"].str.contains("Other", case=False, na=False)]
-    not_applicable = coded_df[coded_df[f"{question_label}_MinorTheme1"].str.contains("Not applicable", case=False, na=False)]
+    other_themes = minor_series.str.contains("Other", case=False, na=False)
+    not_applicable = minor_series.str.contains("Not applicable", case=False, na=False)
     manual_review_needed = coded_df.get("ManualReview", pd.Series([False] * len(coded_df), dtype=bool))
     
-    other_count = len(other_themes)
-    not_applicable_count = len(not_applicable)
+    other_count = int(other_themes.sum())
+    not_applicable_count = int(not_applicable.sum())
     manual_review_count = manual_review_needed.sum() if hasattr(manual_review_needed, 'sum') else 0
     
     other_percent = (other_count / total_responses * 100) if total_responses > 0 else 0
@@ -2232,7 +2212,7 @@ def analyze_theme_distribution(coded_df: pd.DataFrame, tiny_threshold: float, th
     manual_review_percent = (manual_review_count / total_responses * 100) if total_responses > 0 else 0
     
     # Identify themes with very low counts (potential candidates for "Other")
-    theme_counts = coded_df[f"{question_label}_MinorTheme1"].value_counts()
+    theme_counts = minor_series.value_counts()
     tiny_themes = theme_counts[theme_counts == 1]  # Single-response themes
     tiny_theme_count = len(tiny_themes)
     tiny_theme_percent = (tiny_theme_count / total_responses * 100) if total_responses > 0 else 0
@@ -2443,7 +2423,12 @@ def analyze_coverage_accuracy(coded_df: pd.DataFrame, theme_dict: Dict[str, Any]
     if not theme_dict or "major_themes" not in theme_dict:
         return {}
     
-    total_responses = len(coded_df)
+    prefixes = [question_label if len(text_cols) == 1 else f"{question_label}_{col}" for col in text_cols]
+    minor_cols = [f"{p}_MinorTheme1" for p in prefixes]
+    oe_cols = [f"{p}_OE" for p in prefixes]
+    minor_series = pd.concat([coded_df[c] for c in minor_cols], ignore_index=True)
+    oe_series = pd.concat([coded_df[c] for c in oe_cols], ignore_index=True)
+    total_responses = int(oe_series.notna().sum())
     coverage_results = []
     
     # Build theme label to estimated percentage mapping
@@ -2456,7 +2441,7 @@ def analyze_coverage_accuracy(coded_df: pd.DataFrame, theme_dict: Dict[str, Any]
                 theme_estimates[sub.get("label", "")] = sub.get("approx_pct", 0.0)
     
     # Compare with actual counts
-    actual_counts = coded_df[f"{question_label}_MinorTheme1"].value_counts()
+    actual_counts = minor_series.value_counts()
     
     for theme_label, estimated_pct in theme_estimates.items():
         actual_count = actual_counts.get(theme_label, 0)
@@ -2595,7 +2580,7 @@ with st.sidebar:
     seed = 42  # Hard-coded for deterministic results
     st.info("Current Mode: GPT-5.2 for All Steps")
     redact_pii_enabled = True
-    allow_multicode = st.toggle("Multi‑coding", value=True)
+    allow_multicode = st.toggle("Multi‑coding", value=False)
 
     max_codes = 3
     single_or_multi = "Multi" if allow_multicode else "Single"
@@ -2603,7 +2588,7 @@ with st.sidebar:
     embedding_model = st.selectbox(
         "Embedding model",
         options=["text-embedding-3-small", "text-embedding-3-large"],
-        index=0,
+        index=1,
     )
     top_k = st.slider("Candidate shortlist size (top_k)", 3, 12, 6, 1)
 
@@ -2637,24 +2622,82 @@ else:
 # Clean column headers
 df.columns = [str(c).strip() for c in df.columns]
 
-# Ask for question column
-text_col = st.selectbox("Select the open‑end column", options=df.columns.tolist())
+# Ask for question column(s)
+st.write("**Select open‑end column(s)**")
+group_mode = st.radio(
+    "Column grouping",
+    ["Single column", "Auto-group by prefix", "Manual multi-select"],
+    horizontal=True,
+)
 
-# Reset downstream results if the uploaded file or selected column changed
-_input_sig = (uploaded.name, getattr(uploaded, "size", None), text_col)
+def _infer_group_key(col_name: str) -> str:
+    cleaned = str(col_name or "").strip()
+    cleaned = re.sub(r"\s*\(.*?\)\s*$", "", cleaned)
+    cleaned = re.sub(r"[\s_-]*(?:\d+|[A-Za-z])\s*$", "", cleaned).strip()
+    return cleaned if cleaned else str(col_name or "").strip()
+
+text_cols: List[str] = []
+group_label = ""
+
+if group_mode == "Single column":
+    text_col = st.selectbox("Open‑end column", options=df.columns.tolist())
+    text_cols = [text_col]
+    group_label = text_col
+else:
+    grouped: Dict[str, List[str]] = {}
+    for col in df.columns.tolist():
+        key = _infer_group_key(col)
+        grouped.setdefault(key, []).append(col)
+    grouped = {k: v for k, v in grouped.items() if len(v) > 1}
+
+    if group_mode == "Auto-group by prefix":
+        if grouped:
+            group_label = st.selectbox("Auto-grouped question", options=sorted(grouped.keys()))
+            text_cols = grouped.get(group_label, [])
+            st.caption(f"Grouped columns: {', '.join(text_cols)}")
+        else:
+            st.warning("No multi-column groups detected. Please use manual selection.")
+            group_mode = "Manual multi-select"
+
+    if group_mode == "Manual multi-select":
+        text_cols = st.multiselect(
+            "Open‑end columns",
+            options=df.columns.tolist(),
+        )
+        group_label = " / ".join(text_cols) if text_cols else ""
+
+if not text_cols:
+    st.stop()
+
+# Reset downstream results if the uploaded file or selected columns changed
+_input_sig = (uploaded.name, getattr(uploaded, "size", None), tuple(text_cols))
 if st.session_state.get("_input_sig") != _input_sig:
-    for k in ("assigned_raw", "theme_validation", "_usage_totals", "_auto_verified", "theme_governance_log", "_cache_stats"):
+    for k in ("assigned_raw", "theme_validation", "_usage_totals", "_auto_verified", "theme_governance_log", "_cache_stats", "assignment_index_map", "destination_normalization_map"):
         st.session_state.pop(k, None)
     st.session_state["_input_sig"] = _input_sig
+
+if "destination_normalization_map" not in st.session_state:
+    st.session_state["destination_normalization_map"] = {}
 
 # Optional ID passthrough
 id_cols_guess = [c for c in df.columns if c.lower() in {"id", "respondent_id", "record id", "record_id", "transaction id", "transaction_id", "uuid"}]
 pass_id_cols = st.multiselect("ID columns to carry through", options=df.columns.tolist(), default=id_cols_guess)
 
 
-# Prepare series
-ser = df[text_col].map(clean_text)
-ser_ai = ser.map(redact_pii) if redact_pii_enabled else ser
+# Prepare series (combined across selected columns)
+column_ser = {col: df[col].map(clean_text) for col in text_cols}
+column_ser_ai = {col: (column_ser[col].map(redact_pii) if redact_pii_enabled else column_ser[col]) for col in text_cols}
+
+combined_texts: List[str] = []
+combined_index_map: List[Dict[str, Any]] = []
+for row_idx in range(len(df)):
+    for col in text_cols:
+        combined_texts.append(str(column_ser_ai[col].iloc[row_idx]) if pd.notna(column_ser_ai[col].iloc[row_idx]) else "")
+        combined_index_map.append({"row_index": row_idx, "column": col})
+
+ser = pd.Series(combined_texts)
+ser_ai = ser
+st.session_state["assignment_index_map"] = combined_index_map
 
 # Build unique set with frequency weights (AI-safe text) but preserve order for output mapping
 value_counts = ser_ai.value_counts(dropna=False)
@@ -2664,11 +2707,11 @@ unique_freqs = value_counts.values.tolist()
 # Initialize OpenAI client
 client = get_openai_client()
 
-# Use the selected column header as question context
-question_text = text_col
+# Use the selected columns as question context
+question_text = group_label or " / ".join(text_cols)
 
 # Infer a compact question label (qAge, qGender, etc.)
-label_key = f"question_label::{text_col}"
+label_key = f"question_label::{question_text}"
 if st.session_state.get(label_key) is None:
     with st.spinner("Inferring question label..."):
         st.session_state[label_key] = infer_question_label(client, model, question_text, seed)
@@ -2676,10 +2719,20 @@ question_label = st.session_state[label_key]
 
 # Run signature + prompt versions
 dataset_sig = dataset_signature(ser_ai.fillna("").astype(str).tolist(), question_text)
+normalization_question_text = text_cols[0] if text_cols else question_text
+normalization_guidance_text = st.session_state.get(f"question_guidance::{question_text}", "").strip() if "question_text" in globals() else ""
+normalization_target_type = st.session_state.get("guidance_target_type", "auto")
+dest_norm_user = PIPE_DESTINATION_NORMALIZE_USER_TEMPLATE.format(
+    question_text=normalization_question_text,
+    guidance_text=normalization_guidance_text or "No additional guidance.",
+    target_type=normalization_target_type,
+    items_json="__ITEMS__",
+)
 prompt_versions = {
     "theme_discovery": compute_prompt_version(PIPE_THEME_DISCOVERY_SYSTEM, PIPE_THEME_DISCOVERY_USER),
     "governance": compute_prompt_version(PIPE_GOVERNANCE_SYSTEM, PIPE_GOVERNANCE_USER_TEMPLATE),
     "assignment_stage2": compute_prompt_version(PIPE_ASSIGNMENT_STAGE2_SYSTEM, PIPE_ASSIGNMENT_STAGE2_USER_TEMPLATE),
+    "destination_normalization": compute_prompt_version(PIPE_DESTINATION_NORMALIZE_SYSTEM, dest_norm_user),
 }
 run_settings = {
     "model": model,
@@ -2689,6 +2742,8 @@ run_settings = {
     "low_thresh": float(low_thresh),
     "top_k": int(top_k),
     "embedding_model": embedding_model,
+    "question_columns": text_cols,
+    "destination_normalization_model": "gpt-4o",
 }
 run_id = compute_run_id(dataset_sig, model, seed, prompt_versions, run_settings)
 st.session_state["run_id"] = run_id
@@ -2786,7 +2841,7 @@ if theme_source == "Upload existing themes":
             st.rerun()
 
 # Guidance input section
-guidance_key = f"question_guidance::{text_col}"
+guidance_key = f"question_guidance::{question_text}"
 if theme_source == "Add coding context":
     st.write("**Provide guidance for theme generation and/or assignment:**")
     guidance_text = st.text_area(
@@ -2803,14 +2858,14 @@ if theme_source == "Add coding context":
 
     st.write("**Target type (optional):**")
     target_options = {
+        "Destination": "destination",
         "Auto (from guidance)": "auto",
-        "Location (catch-all)": "location",
-        "City (strict)": "city",
+        "Location (General)": "location",
+        "City": "city",
         "County": "county",
         "Country": "country",
         "US state": "state",
         "Brand": "brand",
-        "Destination": "destination",
         "Adjective/descriptor": "adjective",
         "One-word response": "one_word",
     }
@@ -2820,6 +2875,8 @@ if theme_source == "Add coding context":
         index=0,
     )
     st.session_state["guidance_target_type"] = target_options[selected_label]
+    if st.session_state["guidance_target_type"] != "auto":
+        st.caption("Target normalization uses AI and may increase runtime.")
 
     st.write("**Location normalization (Nominatim):**")
     normalize_locations = st.checkbox(
@@ -2847,21 +2904,6 @@ if theme_source == "Add coding context":
 active_guidance = st.session_state.get(guidance_key, "").strip()
 if active_guidance:
     st.caption(f"**Active guidance:** {active_guidance}")
-    # #region agent log
-    try:
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H1",
-                "location": "app_v1.py:guidance:active",
-                "message": "Active guidance set",
-                "data": {"guidance_len": len(active_guidance)},
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-    # #endregion
 
 if theme_source == "Add coding context":
     run_settings["normalize_locations"] = bool(st.session_state.get("normalize_locations", False))
@@ -2875,21 +2917,6 @@ show_generate = theme_source == "Generate new themes" or (
     theme_source == "Add coding context" and bool(active_guidance)
 )
 if show_generate:
-    # #region agent log
-    try:
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H2",
-                "location": "app_v1.py:theme_gen:entry",
-                "message": "Theme generation section visible",
-                "data": {"show_generate": True, "guidance_len": len(active_guidance or "")},
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-    # #endregion
     # Cost estimation before generation
     pricing_table = {
         "gpt-5.2": {"prompt_per_1k": 0.005, "completion_per_1k": 0.015},  # Estimated pricing
@@ -2914,24 +2941,7 @@ if show_generate:
     # Keep estimation internal; no extra UI noise
 
     if st.button("Process Themes", type="primary"):
-        # #region agent log
-        try:
-            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "sessionId": "debug-session",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H3",
-                    "location": "app_v1.py:theme_gen:click",
-                    "message": "Process Themes clicked",
-                    "data": {
-                        "guidance_len": len(st.session_state.get(guidance_key, "") or ""),
-                        "theme_source": theme_source,
-                    },
-                    "timestamp": int(time.time() * 1000),
-                }) + "\n")
-        except Exception:
-            pass
-        # #endregion
+        st.session_state["theme_source"] = theme_source
         # Start the overall timer
         overall_start_time = time.time()
         
@@ -2966,6 +2976,51 @@ if show_generate:
                 theme_status,
                 question_context,
             )
+            if isinstance(theme_dict, str):
+                try:
+                    theme_dict = json.loads(theme_dict)
+                except Exception:
+                    st.error("Theme generation returned invalid JSON. Please rerun or adjust guidance.")
+                    st.stop()
+            if isinstance(theme_dict, list):
+                if all(isinstance(m, dict) for m in theme_dict):
+                    theme_dict = {"major_themes": theme_dict}
+                else:
+                    parsed = []
+                    for m in theme_dict:
+                        if isinstance(m, dict):
+                            parsed.append(m)
+                        elif isinstance(m, str):
+                            try:
+                                parsed_m = json.loads(m)
+                                if isinstance(parsed_m, dict):
+                                    parsed.append(parsed_m)
+                            except Exception:
+                                continue
+                    if parsed:
+                        theme_dict = {"major_themes": parsed}
+                    else:
+                        st.error("Theme generation returned invalid theme structure. Please rerun or adjust guidance.")
+                        st.stop()
+            if isinstance(theme_dict, dict):
+                majors = theme_dict.get("major_themes")
+                if isinstance(majors, list) and any(not isinstance(m, dict) for m in majors):
+                    fixed = []
+                    for m in majors:
+                        if isinstance(m, dict):
+                            fixed.append(m)
+                        elif isinstance(m, str):
+                            try:
+                                parsed_m = json.loads(m)
+                                if isinstance(parsed_m, dict):
+                                    fixed.append(parsed_m)
+                            except Exception:
+                                continue
+                    if fixed:
+                        theme_dict["major_themes"] = fixed
+                    else:
+                        st.error("Theme generation returned invalid theme structure. Please rerun or adjust guidance.")
+                        st.stop()
             theme_dict = ensure_nonanswer_theme(theme_dict)
 
             try:
@@ -3052,22 +3107,30 @@ if "theme_dict" not in st.session_state or "assigned_raw" not in st.session_stat
     st.stop()
 
 # Auto-merge tiny sub-themes into "Other" based on dynamic thresholds
-dynamic_thresholds = calculate_dynamic_thresholds(
-    st.session_state.get("theme_dict"),
-    st.session_state.get("assigned_raw"),
-)
-tiny_threshold = dynamic_thresholds.get("tiny_threshold", 1.0)
-other_usage_threshold = dynamic_thresholds.get("other_usage_threshold", 15.0)
+if st.session_state.get("theme_source") == "Add coding context":
+    dynamic_thresholds = {"recommendations": []}
+    tiny_threshold = 1.0
+    other_usage_threshold = 15.0
+    merged_theme_dict = st.session_state.get("theme_dict")
+    merged_assignments = st.session_state.get("assigned_raw")
+    merge_report = {"merged_count": 0, "other_exceeded": False, "other_share_by_major": {}, "skipped": True}
+else:
+    dynamic_thresholds = calculate_dynamic_thresholds(
+        st.session_state.get("theme_dict"),
+        st.session_state.get("assigned_raw"),
+    )
+    tiny_threshold = dynamic_thresholds.get("tiny_threshold", 1.0)
+    other_usage_threshold = dynamic_thresholds.get("other_usage_threshold", 15.0)
 
-merged_theme_dict, merged_assignments, merge_report = auto_merge_tiny_subthemes(
-    st.session_state["theme_dict"],
-    st.session_state["assigned_raw"],
-    tiny_threshold_pct=tiny_threshold,
-    other_usage_threshold_pct=other_usage_threshold,
-)
-st.session_state["theme_dict"] = merged_theme_dict
-st.session_state["assigned_raw"] = merged_assignments
-st.session_state["merge_report"] = merge_report
+    merged_theme_dict, merged_assignments, merge_report = auto_merge_tiny_subthemes(
+        st.session_state["theme_dict"],
+        st.session_state["assigned_raw"],
+        tiny_threshold_pct=tiny_threshold,
+        other_usage_threshold_pct=other_usage_threshold,
+    )
+    st.session_state["theme_dict"] = merged_theme_dict
+    st.session_state["assigned_raw"] = merged_assignments
+    st.session_state["merge_report"] = merge_report
 
 if merge_report.get("merged_count", 0) > 0:
     st.info(
@@ -3134,34 +3197,37 @@ with pd.ExcelWriter(comprehensive_buf, engine="xlsxwriter") as writer:
     if "assigned_raw" in st.session_state:
         # Build a preview of coded data for the comprehensive export
         assign_map = {x["idx"]: x for x in st.session_state["assigned_raw"]}
+        index_map = st.session_state.get("assignment_index_map", [])
         major_map = map_theme_id_to_major(theme_df)
         label_map = {r["ThemeID"]: r["Label"] for _, r in theme_df.iterrows()}
         theme_levels = {r["ThemeID"]: r["Level"] for _, r in theme_df.iterrows()}
-        
+
         # Create a sample of coded data (first 100 rows for export)
         sample_coded_rows = []
-        for i in range(min(100, len(assign_map))):
+        for i in range(min(100, len(index_map))):
             item = assign_map.get(i, {"assignments": [], "rationale": ""})
             assigns = item.get("assignments", [])
             if assigns:
                 primary_theme_id = assigns[0].get("theme_id", "")
                 primary_major = major_map.get(primary_theme_id, "")
                 primary_sub = primary_theme_id if theme_levels.get(primary_theme_id) == "Sub" else ""
-                
+                meta = index_map[i] if i < len(index_map) else {}
+
                 sample_coded_rows.append({
-                    "Response_Index": i,
-                    "Question": text_col,
+                    "Response_Index": meta.get("row_index", i),
+                    "QuestionColumn": meta.get("column", ""),
+                    "Question": question_text,
                     "QuestionLabel": question_label,
                     "MajorTheme": label_map.get(primary_major, ""),
                     "SubTheme": label_map.get(primary_theme_id, "") if primary_sub else "",
                 })
-        
+
         if sample_coded_rows:
             sample_coded_df = pd.DataFrame(sample_coded_rows)
             sample_coded_df.to_excel(writer, sheet_name="Sample Coded Data", index=False)
 
     # Add question mapping sheet
-    question_map_df = pd.DataFrame([{"QuestionLabel": question_label, "QuestionText": text_col, "RunId": st.session_state.get("run_id", "")}])
+    question_map_df = pd.DataFrame([{"QuestionLabel": question_label, "QuestionText": question_text, "QuestionColumns": " | ".join(text_cols), "RunId": st.session_state.get("run_id", "")}])
     question_map_df.to_excel(writer, sheet_name="Question Map", index=False)
 
 st.download_button(
@@ -3174,6 +3240,7 @@ st.download_button(
 
 # Build coded DataFrame first
 assign_map = {x["idx"]: x for x in st.session_state["assigned_raw"]}
+index_map = st.session_state.get("assignment_index_map", [])
 
 # Theme map helpers
 major_map = map_theme_id_to_major(theme_df)
@@ -3181,48 +3248,48 @@ label_map = {r["ThemeID"]: r["Label"] for _, r in theme_df.iterrows()}
 parent_map = {r["ThemeID"]: r["ParentThemeID"] for _, r in theme_df.iterrows()}
 theme_levels = {r["ThemeID"]: r["Level"] for _, r in theme_df.iterrows()}
 
+def _column_prefix(col_name: str) -> str:
+    return question_label if len(text_cols) == 1 else f"{question_label}_{col_name}"
+
+assigned_by_col: Dict[str, Dict[int, Dict[str, Any]]] = {col: {} for col in text_cols}
+for idx, meta in enumerate(index_map):
+    col_name = meta.get("column")
+    row_index = meta.get("row_index")
+    if col_name in assigned_by_col and isinstance(row_index, int):
+        assigned_by_col[col_name][row_index] = assign_map.get(idx, {"assignments": [], "rationale": ""})
+
 coded_rows = []
 for i in range(len(df)):
-    item = assign_map.get(i, {"assignments": [], "rationale": ""})
-    assigns = item.get("assignments", [])
-    assigns = sorted(assigns, key=lambda a: a.get("confidence", 0.0), reverse=True)
-    assigns = assigns[: (max_codes if allow_multicode else 1)]
+    row = {"RowIndex": i}
 
-    codes = [a.get("theme_id") for a in assigns]
-    confs = [float(a.get("confidence", 0.0)) for a in assigns]
-    # Map each sub-theme to its corresponding major theme label (aligned with codes)
-    major_ids_aligned = [(parent_map.get(code_id) or code_id) for code_id in codes]
-    major_labels_aligned = [label_map.get(mid, "") for mid in major_ids_aligned]
+    for col in text_cols:
+        item = assigned_by_col.get(col, {}).get(i, {"assignments": [], "rationale": ""})
+        assigns = item.get("assignments", [])
+        assigns = sorted(assigns, key=lambda a: a.get("confidence", 0.0), reverse=True)
+        assigns = assigns[: (max_codes if allow_multicode else 1)]
 
-    # Determine primary theme for single code view
-    primary_theme_id = codes[0] if codes else ""
-    primary_major = major_map.get(primary_theme_id, "")
-    primary_sub = primary_theme_id if theme_levels.get(primary_theme_id) == "Sub" else ""
+        codes = [a.get("theme_id") for a in assigns]
+        confs = [float(a.get("confidence", 0.0)) for a in assigns]
+        major_ids_aligned = [(parent_map.get(code_id) or code_id) for code_id in codes]
+        major_labels_aligned = [label_map.get(mid, "") for mid in major_ids_aligned]
+        code_labels = [label_map.get(code_id, "") for code_id in codes if code_id]
 
-    code_labels = [label_map.get(code_id, "") for code_id in codes if code_id]
-    codes_str = "; ".join([c for c in code_labels if c])
+        prefix = _column_prefix(col)
+        row[f"{prefix}_OE"] = column_ser.get(col, pd.Series([""])).iloc[i]
+        row[f"{prefix}_MajorTheme1"] = major_labels_aligned[0] if len(major_labels_aligned) > 0 else ""
+        row[f"{prefix}_MinorTheme1"] = code_labels[0] if len(code_labels) > 0 else ""
+        row[f"{prefix}_Theme1_Confidence"] = confs[0] if len(confs) > 0 else np.nan
 
-    top_confidence = float(max(confs)) if confs else 0.0
+        if allow_multicode:
+            row[f"{prefix}_MajorTheme2"] = major_labels_aligned[1] if len(major_labels_aligned) > 1 else ""
+            row[f"{prefix}_MajorTheme3"] = major_labels_aligned[2] if len(major_labels_aligned) > 2 else ""
+            row[f"{prefix}_MinorTheme2"] = code_labels[1] if len(code_labels) > 1 else ""
+            row[f"{prefix}_MinorTheme3"] = code_labels[2] if len(code_labels) > 2 else ""
+            row[f"{prefix}_Theme2_Confidence"] = confs[1] if len(confs) > 1 else np.nan
+            row[f"{prefix}_Theme3_Confidence"] = confs[2] if len(confs) > 2 else np.nan
 
-    row = {
-        "RowIndex": i,
-        f"{question_label}_OE": ser.iloc[i],
-        f"{question_label}_MajorTheme1": major_labels_aligned[0] if len(major_labels_aligned) > 0 else "",
-        f"{question_label}_MinorTheme1": code_labels[0] if len(code_labels) > 0 else "",
-        f"{question_label}_Theme1_Confidence": confs[0] if len(confs) > 0 else np.nan,
-    }
-
-    if allow_multicode:
-        row.update({
-            f"{question_label}_MajorTheme2": major_labels_aligned[1] if len(major_labels_aligned) > 1 else "",
-            f"{question_label}_MajorTheme3": major_labels_aligned[2] if len(major_labels_aligned) > 2 else "",
-            f"{question_label}_MinorTheme2": code_labels[1] if len(code_labels) > 1 else "",
-            f"{question_label}_MinorTheme3": code_labels[2] if len(code_labels) > 2 else "",
-            f"{question_label}_Theme2_Confidence": confs[1] if len(confs) > 1 else np.nan,
-            f"{question_label}_Theme3_Confidence": confs[2] if len(confs) > 2 else np.nan,
-        })
-
-    row["IsMultiCoded"] = (len(codes) > 1)
+        is_multi_col = "IsMultiCoded" if len(text_cols) == 1 else f"{prefix}_IsMultiCoded"
+        row[is_multi_col] = (len(codes) > 1)
 
     # Carry through IDs
     for c in pass_id_cols:
@@ -3233,30 +3300,27 @@ coded_df = pd.DataFrame(coded_rows)
 
 # Order columns
 id_before = pass_id_cols.copy()
-base_cols = [
-    "RowIndex",
-    f"{question_label}_OE",
-    f"{question_label}_MajorTheme1",
-    f"{question_label}_MinorTheme1",
-    f"{question_label}_Theme1_Confidence",
-    "IsMultiCoded",
-]
+base_cols: List[str] = ["RowIndex"]
+for col in text_cols:
+    prefix = _column_prefix(col)
+    base_cols.extend([
+        f"{prefix}_OE",
+        f"{prefix}_MajorTheme1",
+        f"{prefix}_MinorTheme1",
+        f"{prefix}_Theme1_Confidence",
+    ])
+    if allow_multicode:
+        base_cols.extend([
+            f"{prefix}_MajorTheme2",
+            f"{prefix}_MajorTheme3",
+            f"{prefix}_MinorTheme2",
+            f"{prefix}_MinorTheme3",
+            f"{prefix}_Theme2_Confidence",
+            f"{prefix}_Theme3_Confidence",
+        ])
+    is_multi_col = "IsMultiCoded" if len(text_cols) == 1 else f"{prefix}_IsMultiCoded"
+    base_cols.append(is_multi_col)
 
-if allow_multicode:
-    base_cols = [
-        "RowIndex",
-        f"{question_label}_OE",
-        f"{question_label}_MajorTheme1",
-        f"{question_label}_MajorTheme2",
-        f"{question_label}_MajorTheme3",
-        f"{question_label}_MinorTheme1",
-        f"{question_label}_MinorTheme2",
-        f"{question_label}_MinorTheme3",
-        f"{question_label}_Theme1_Confidence",
-        f"{question_label}_Theme2_Confidence",
-        f"{question_label}_Theme3_Confidence",
-        "IsMultiCoded",
-    ]
 ordered_cols = id_before + base_cols
 coded_df = coded_df[ordered_cols]
 
@@ -3421,7 +3485,12 @@ st.divider()
 st.subheader("Theme distribution")
 
 # Compute support counts using primary MinorTheme1 as assignment for counting
-count_series = coded_df[f"{question_label}_MinorTheme1"].replace("", np.nan).dropna()
+prefixes = [_column_prefix(c) for c in text_cols]
+minor_cols = [f"{p}_MinorTheme1" for p in prefixes]
+count_series = pd.concat(
+    [coded_df[c].replace("", np.nan) for c in minor_cols],
+    ignore_index=True,
+).dropna()
 counts = count_series.value_counts().rename_axis("Theme").reset_index(name="Count")
 
 # Attach Major label for grouping
@@ -3441,13 +3510,15 @@ st.write("**Statistical Summary**")
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    response_series = coded_df[f"{question_label}_OE"]
+    oe_cols = [f"{p}_OE" for p in prefixes]
+    response_series = pd.concat([coded_df[c] for c in oe_cols], ignore_index=True)
     non_empty_mask = response_series.notna() & response_series.astype(str).str.strip().ne("")
     total_responses = int(non_empty_mask.sum())
     st.metric("Total Responses", f"{total_responses:,}")
 
 with col2:
-    coded_mask = non_empty_mask & coded_df[f"{question_label}_MinorTheme1"].astype(str).str.strip().ne("")
+    coded_series = pd.concat([coded_df[c] for c in minor_cols], ignore_index=True)
+    coded_mask = coded_series.astype(str).str.strip().ne("")
     coded_responses = int(coded_mask.sum())
     st.metric("Coded Responses", f"{coded_responses:,}")
 
@@ -3456,7 +3527,11 @@ with col3:
     st.metric("Coding Rate", f"{coding_rate:.1f}%")
 
 with col4:
-    avg_confidence = coded_df.loc[coded_mask, f"{question_label}_Theme1_Confidence"].mean()
+    conf_values = []
+    for prefix in prefixes:
+        mask = coded_df[f"{prefix}_MinorTheme1"].astype(str).str.strip().ne("")
+        conf_values.append(coded_df.loc[mask, f"{prefix}_Theme1_Confidence"])
+    avg_confidence = pd.concat(conf_values, ignore_index=True).mean() if conf_values else 0.0
     avg_confidence = float(avg_confidence) if coded_responses > 0 else 0.0
     st.metric("Avg Confidence", f"{avg_confidence:.2f}")
 
@@ -3464,8 +3539,10 @@ with col4:
 st.write("**Theme Distribution**")
 
 # Prepare data for charting
-major_counts = coded_df[f"{question_label}_MajorTheme1"].value_counts()
-sub_counts = coded_df[f"{question_label}_MinorTheme1"].value_counts()
+major_cols = [f"{p}_MajorTheme1" for p in prefixes]
+sub_cols = [f"{p}_MinorTheme1" for p in prefixes]
+major_counts = pd.concat([coded_df[c] for c in major_cols], ignore_index=True).value_counts()
+sub_counts = pd.concat([coded_df[c] for c in sub_cols], ignore_index=True).value_counts()
 
 # Create dataframes
 major_df = pd.DataFrame({
@@ -3634,7 +3711,7 @@ buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
     coded_df.to_excel(writer, sheet_name="Coded Data", index=False)
     theme_export.to_excel(writer, sheet_name="Theme Dictionary", index=False)
-    question_map_df = pd.DataFrame([{"QuestionLabel": question_label, "QuestionText": text_col, "RunId": st.session_state.get("run_id", "")}])
+    question_map_df = pd.DataFrame([{"QuestionLabel": question_label, "QuestionText": question_text, "QuestionColumns": " | ".join(text_cols), "RunId": st.session_state.get("run_id", "")}])
     question_map_df.to_excel(writer, sheet_name="Question Map", index=False)
     governance_log = st.session_state.get("theme_governance_log") or []
     if governance_log:
@@ -3670,7 +3747,7 @@ theme_params["guidance_text"] = active_guidance
 run_audit = build_run_audit(
     run_id=st.session_state.get("run_id", ""),
     dataset_sig=dataset_sig,
-    question_text=text_col,
+    question_text=question_text,
     theme_params=theme_params,
     governance_log=st.session_state.get("theme_governance_log", []),
     assignment_params=assignment_params,

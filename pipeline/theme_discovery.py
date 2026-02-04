@@ -4,6 +4,9 @@ import json
 import re
 import time
 import hashlib
+import difflib
+import random
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Tuple, Callable
 
 from pipeline.llm_client import (
@@ -284,6 +287,348 @@ def _normalize_brand_destination(text: str) -> str:
     return _normalize_value_label(text)
 
 
+DESTINATION_FUZZY_THRESHOLD = 0.95
+DESTINATION_NORMALIZE_MODEL = "gpt-4o"
+DESTINATION_BATCH_MAX_ITEMS = 10
+DESTINATION_BATCH_TOKEN_CAP = 12_000
+DESTINATION_BATCH_MAX_WORKERS = 6
+DESTINATION_BATCH_TIMEOUT_SEC = 90
+DESTINATION_NORMALIZE_TRUNCATE_CHARS = 200
+
+DESTINATION_NORMALIZE_SYSTEM = (
+    "You canonicalize destination responses. Use the question and guidance to decide how to normalize. "
+    "If unsure, return a cleaned, title-cased version of the input. "
+    "If the input is a non-response (e.g., n/a, none, prefer not to say), "
+    "set is_non_response=true and label must be empty. Return English-only labels."
+)
+
+DESTINATION_NORMALIZE_USER_TEMPLATE = (
+    "Schema version: v1\n"
+    "Question: {question_text}\n"
+    "Guidance: {guidance_text}\n"
+    "Normalize each item to a canonical destination label.\n"
+    "Rules:\n"
+    "- Valid destinations include cities, states, parks, monuments, venues, attractions.\n"
+    "- If ambiguous (e.g., 'Disney'), set is_general=true and label should be 'Disney (General)'.\n"
+    "- Do NOT return empty label unless is_non_response=true.\n"
+    "- If unsure, return cleaned, title-cased input.\n"
+    "- Only mark non-response for explicit non-responses (n/a, none, prefer not, don't know).\n"
+    "- Return English-only labels; no emojis.\n\n"
+    "- Return one output item per input item and preserve idx.\n\n"
+    "Examples:\n"
+    "Input: \"Disney\"\n"
+    "Output: {{\"label\":\"Disney (General)\",\"is_general\":true,\"is_non_response\":false}}\n"
+    "Input: \"Disney land\"\n"
+    "Output: {{\"label\":\"Disneyland\",\"is_general\":false,\"is_non_response\":false}}\n"
+    "Input: \"LA\"\n"
+    "Output: {{\"label\":\"Los Angeles, CA\",\"is_general\":false,\"is_non_response\":false}}\n"
+    "Input: \"n/a\"\n"
+    "Output: {{\"label\":\"\",\"is_general\":false,\"is_non_response\":true}}\n\n"
+    "Items (JSON array):\n"
+    "{items_json}\n"
+)
+
+DESTINATION_NORMALIZE_SCHEMA: Dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "destination_normalization",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "idx": {"type": "integer"},
+                            "label": {"type": "string"},
+                            "is_general": {"type": "boolean"},
+                            "is_non_response": {"type": "boolean"},
+                        },
+                        "required": ["idx", "label", "is_general", "is_non_response"],
+                        "additionalProperties": True,
+                    },
+                }
+            },
+            "required": ["items"],
+            "additionalProperties": True,
+        },
+        "strict": False,
+    },
+}
+
+DESTINATION_ALIAS_MAP = {
+    "la": "Los Angeles, CA",
+    "nyc": "New York, NY",
+    "sf": "San Francisco, CA",
+    "dc": "Washington, DC",
+    "sd": "San Diego, CA",
+    "sj": "San Jose, CA",
+    "lv": "Las Vegas, NV",
+    "nola": "New Orleans, LA",
+    "philly": "Philadelphia, PA",
+    "atl": "Atlanta, GA",
+}
+
+
+def _destination_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+def _expand_destination_aliases(label: str) -> str:
+    key = _destination_key(label)
+    if not key:
+        return ""
+    return DESTINATION_ALIAS_MAP.get(key, label)
+
+
+def _fuzzy_merge_destination(label: str, existing_labels: List[str]) -> str:
+    if not existing_labels:
+        return label
+    key = _destination_key(label)
+    if not key:
+        return label
+    best_label = label
+    best_score = 0.0
+    for existing in existing_labels:
+        existing_key = _destination_key(existing)
+        if not existing_key:
+            continue
+        score = difflib.SequenceMatcher(a=key, b=existing_key).ratio()
+        if score > best_score:
+            best_score = score
+            best_label = existing
+    if best_score >= DESTINATION_FUZZY_THRESHOLD:
+        return best_label
+    return label
+
+
+def _clean_normalized_label(label: str) -> str:
+    cleaned = (label or "").encode("ascii", errors="ignore").decode("ascii")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+_ATTRACTION_KEYWORDS = {
+    "park",
+    "canyon",
+    "resort",
+    "memorial",
+    "monument",
+    "museum",
+    "trail",
+    "bridge",
+    "island",
+    "beach",
+    "lake",
+    "mount",
+    "mountain",
+    "falls",
+    "valley",
+    "forest",
+    "zoo",
+    "aquarium",
+    "stadium",
+    "garden",
+    "square",
+    "tower",
+    "pier",
+    "national park",
+    "state park",
+}
+
+
+def _contains_attraction_keyword(label: str) -> bool:
+    lowered = (label or "").lower()
+    return any(keyword in lowered for keyword in _ATTRACTION_KEYWORDS)
+
+
+def _is_more_specific(label: str, geocode_label: str) -> bool:
+    if not label:
+        return False
+    if _contains_attraction_keyword(label) and not _contains_attraction_keyword(geocode_label):
+        return True
+    label_parts = [p for p in re.split(r"[,\s]+", label) if p]
+    geo_parts = [p for p in re.split(r"[,\s]+", geocode_label or "") if p]
+    return len(label_parts) > max(1, len(geo_parts))
+
+
+_EXPLICIT_NON_RESPONSE = {
+    "n/a",
+    "na",
+    "none",
+    "no",
+    "not applicable",
+    "not sure",
+    "dont know",
+    "don't know",
+    "unknown",
+    "prefer not",
+    "prefer not to say",
+    "no answer",
+    "nothing",
+}
+
+
+def _is_explicit_non_response(raw: str) -> bool:
+    text = " ".join(str(raw or "").strip().lower().split())
+    return text in _EXPLICIT_NON_RESPONSE
+
+
+def _force_general_suffix(label: str) -> str:
+    if not label:
+        return ""
+    if "(general)" in label.lower():
+        return label
+    return f"{label} (General)"
+
+
+def _build_destination_batches(
+    items: List[Dict[str, Any]],
+    question_text: str,
+    guidance_text: str,
+    target_type: str,
+) -> List[List[Dict[str, Any]]]:
+    base_user = DESTINATION_NORMALIZE_USER_TEMPLATE.format(
+        question_text=question_text,
+        guidance_text=guidance_text,
+        target_type=target_type,
+        items_json="[]",
+    )
+    base_tokens = estimate_tokens(DESTINATION_NORMALIZE_SYSTEM + base_user)
+    batches: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    current_tokens = base_tokens
+    for item in items:
+        item_str = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        item_tokens = estimate_tokens(item_str)
+        if current and (len(current) >= DESTINATION_BATCH_MAX_ITEMS or (current_tokens + item_tokens) > DESTINATION_BATCH_TOKEN_CAP):
+            batches.append(current)
+            current = []
+            current_tokens = base_tokens
+        current.append(item)
+        current_tokens += item_tokens
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _normalize_destination_batch(
+    client,
+    items: List[Dict[str, Any]],
+    question_text: str,
+    guidance_text: str,
+    target_type: str,
+    limiter: RateLimiter,
+    cache: SQLiteCache,
+    cache_stats: CacheStats,
+    seed: int,
+) -> Dict[int, Dict[str, Any]]:
+    items_json = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+    user = DESTINATION_NORMALIZE_USER_TEMPLATE.format(
+        question_text=question_text,
+        guidance_text=guidance_text,
+        target_type=target_type,
+        items_json=items_json,
+    )
+
+    def _on_retry(_: str) -> None:
+        time.sleep(random.uniform(0.05, 0.25))
+
+    data, usage, raw, _ = retry_with_backoff(
+        lambda: oai_json_completion(
+            client,
+            DESTINATION_NORMALIZE_MODEL,
+            DESTINATION_NORMALIZE_SYSTEM,
+            user,
+            seed,
+            response_schema=DESTINATION_NORMALIZE_SCHEMA,
+            limiter=limiter,
+            cache=cache,
+            cache_stats=cache_stats,
+            reasoning_effort="low",
+            verbosity="low",
+            reserve_output_tokens=800,
+        ),
+        max_retries=3,
+        on_retry=_on_retry,
+    )
+
+    data, _, _ = validate_or_repair_json(
+        client,
+        DESTINATION_NORMALIZE_MODEL,
+        data,
+        raw,
+        DESTINATION_NORMALIZE_SCHEMA,
+        seed,
+        limiter,
+        cache,
+        cache_stats,
+        "Destination normalization",
+    )
+    results = {}
+    items_out = data.get("items", []) if isinstance(data, dict) else []
+    for item in items_out:
+        idx = item.get("idx")
+        if isinstance(idx, int):
+            results[idx] = item
+    if len(results) != len(items):
+        raise ValueError(f"Normalization batch size mismatch: expected {len(items)}, got {len(results)}")
+    return results
+
+
+def _canonicalize_destinations_ai(
+    client,
+    raw_items: List[Dict[str, Any]],
+    question_text: str,
+    guidance_text: str,
+    limiter: RateLimiter,
+    cache: SQLiteCache,
+    cache_stats: CacheStats,
+    seed: int,
+    normalization_map: Dict[str, str] | None = None,
+) -> Dict[int, Dict[str, Any]]:
+    if not raw_items:
+        return {}
+
+    sorted_items = sorted(raw_items, key=lambda x: str(x.get("text") or ""))
+    batches = _build_destination_batches(sorted_items, question_text, guidance_text, "destination")
+    results: Dict[int, Dict[str, Any]] = {}
+    errors = 0
+
+    def _run_batch(batch: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+        return _normalize_destination_batch(client, batch, question_text, guidance_text, "destination", limiter, cache, cache_stats, seed)
+
+    with ThreadPoolExecutor(max_workers=DESTINATION_BATCH_MAX_WORKERS) as executor:
+        future_map = {executor.submit(_run_batch, batch): batch for batch in batches}
+        for future, batch in future_map.items():
+            try:
+                batch_result = future.result(timeout=DESTINATION_BATCH_TIMEOUT_SEC)
+                results.update(batch_result)
+            except Exception:
+                errors += 1
+                for item in batch:
+                    try:
+                        single = _run_batch([item])
+                        results.update(single)
+                    except Exception:
+                        continue
+
+    if normalization_map is not None:
+        samples = []
+        for item in sorted_items:
+            idx = item["idx"]
+            raw_text = item["text"]
+            normalized = results.get(idx, {}).get("label", "")
+            is_non_response = results.get(idx, {}).get("is_non_response", False)
+            mapped = "Non-response" if is_non_response else normalized
+            normalization_map[str(raw_text)] = mapped
+            if len(samples) < 10:
+                samples.append({"raw": raw_text, "normalized": mapped, "notes": results.get(idx, {}).get("notes", "")})
+
+    return results
+
+
 def _build_guided_codeframe(
     texts: List[str],
     freq: List[int],
@@ -294,76 +639,310 @@ def _build_guided_codeframe(
     geocode_limiter: GeoRateLimiter | None = None,
     guidance_target_type: str | None = None,
     soft_prefer: bool = True,
+    client=None,
+    limiter: RateLimiter | None = None,
+    cache: SQLiteCache | None = None,
+    cache_stats: CacheStats | None = None,
+    seed: int = 42,
+    normalization_question_text: str | None = None,
+    normalization_map: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     target_type = guidance_target_type if guidance_target_type and guidance_target_type != "auto" else _detect_target_type(guidance_text)
     counts: Dict[str, int] = {}
     examples: Dict[str, List[str]] = {}
     other_examples: List[str] = []
     other_count = 0
-    for text, weight in zip(texts or [], freq or []):
-        raw = str(text or "").strip()
-        if not raw:
-            continue
-        label = ""
-        if target_type in {"city", "state", "country", "county", "location"}:
-            candidate = _extract_location_candidate(raw)
-            if normalize_locations and geocode_user_agent:
-                if target_type == "country":
-                    label, _ = normalize_country(
-                        candidate,
-                        user_agent=geocode_user_agent,
-                        cache=geocode_cache,
-                        limiter=geocode_limiter,
-                    )
-                elif target_type == "state":
-                    label, _ = normalize_state(
-                        candidate,
-                        user_agent=geocode_user_agent,
-                        cache=geocode_cache,
-                        limiter=geocode_limiter,
-                    )
-                elif target_type == "county":
-                    label, _ = normalize_county(
-                        candidate,
-                        user_agent=geocode_user_agent,
-                        cache=geocode_cache,
-                        limiter=geocode_limiter,
-                    )
-                elif target_type == "city":
-                    label, _ = normalize_city(
-                        candidate,
-                        user_agent=geocode_user_agent,
-                        cache=geocode_cache,
-                        limiter=geocode_limiter,
-                    )
+    if target_type in {"destination", "location", "city", "state", "country", "county", "brand", "adjective", "one_word", "general"}:
+        prepared: List[Dict[str, Any]] = []
+        resolved: List[Dict[str, Any]] = []
+        debug_stats = {
+            "total": 0,
+            "ai_empty": 0,
+            "ai_non_response": 0,
+            "fallback_used": 0,
+            "labels_added": 0,
+        }
+        override_count = 0
+        override_samples: List[Dict[str, Any]] = []
+        special_samples: List[Dict[str, Any]] = []
+        for idx, (text, weight) in enumerate(zip(texts or [], freq or [])):
+            raw = str(text or "").strip()
+            if not raw:
+                continue
+            debug_stats["total"] += 1
+            candidate = raw
+            label = ""
+            if target_type in {"location", "city", "state", "country", "county", "destination"}:
+                candidate = _extract_location_candidate(raw)
+                geocode_label = ""
+                if target_type == "destination":
+                    candidate = _expand_destination_aliases(candidate)
+                if normalize_locations and geocode_user_agent:
+                    if target_type == "country":
+                        geocode_label, _ = normalize_country(
+                            candidate,
+                            user_agent=geocode_user_agent,
+                            cache=geocode_cache,
+                            limiter=geocode_limiter,
+                        )
+                    elif target_type == "state":
+                        geocode_label, _ = normalize_state(
+                            candidate,
+                            user_agent=geocode_user_agent,
+                            cache=geocode_cache,
+                            limiter=geocode_limiter,
+                        )
+                    elif target_type == "county":
+                        geocode_label, _ = normalize_county(
+                            candidate,
+                            user_agent=geocode_user_agent,
+                            cache=geocode_cache,
+                            limiter=geocode_limiter,
+                        )
+                    elif target_type == "city":
+                        geocode_label, _ = normalize_city(
+                            candidate,
+                            user_agent=geocode_user_agent,
+                            cache=geocode_cache,
+                            limiter=geocode_limiter,
+                        )
+                    else:
+                        geocode_label, _ = normalize_location(
+                            candidate,
+                            user_agent=geocode_user_agent,
+                            cache=geocode_cache,
+                            limiter=geocode_limiter,
+                        )
+                if target_type != "destination":
+                    label = geocode_label or label
+            elif target_type == "adjective":
+                label = _normalize_adjective(raw)
+            elif target_type == "one_word":
+                label = _normalize_one_word(raw)
+            elif target_type == "brand":
+                label = _normalize_brand_destination(raw)
+            else:
+                label = _normalize_value_label(raw)
+
+            if target_type == "destination" and label:
+                resolved.append({
+                    "idx": idx,
+                    "raw": raw,
+                    "weight": int(weight or 0),
+                    "label": label,
+                })
+            else:
+                if target_type == "destination":
+                    ai_text_source = "candidate"
+                    ai_text = candidate
+                    fallback_label = label or candidate
                 else:
-                    label, _ = normalize_location(
-                        candidate,
-                        user_agent=geocode_user_agent,
-                        cache=geocode_cache,
-                        limiter=geocode_limiter,
-                    )
+                    ai_text_source = "label" if label else ("geocode" if geocode_label else "candidate")
+                    ai_text = label or geocode_label or candidate
+                    fallback_label = label or geocode_label or candidate
+                ai_text = (ai_text or "")[:DESTINATION_NORMALIZE_TRUNCATE_CHARS]
+                prepared.append({
+                    "idx": idx,
+                    "raw": raw,
+                    "weight": int(weight or 0),
+                    "ai_text": ai_text,
+                    "ai_text_source": ai_text_source,
+                    "fallback_label": fallback_label,
+                    "geocode_label": geocode_label,
+                })
+
+        norm_results: Dict[int, Dict[str, Any]] = {}
+        if prepared and client and limiter and cache and cache_stats:
+            items = [{"idx": item["idx"], "text": item["ai_text"]} for item in prepared]
+            norm_results = _canonicalize_destinations_ai(
+                client,
+                items,
+                normalization_question_text or guidance_text or "Destination normalization",
+                guidance_text or "No additional guidance.",
+                limiter,
+                cache,
+                cache_stats,
+                seed,
+                normalization_map=normalization_map,
+            )
+            non_empty = 0
+            for item in prepared:
+                result = norm_results.get(item["idx"], {})
+                if _clean_normalized_label(result.get("label", "") or ""):
+                    non_empty += 1
+            if prepared and (non_empty / max(1, len(prepared)) < 0.2):
+                norm_results = {}
+
+        for item in resolved:
+            raw = item["raw"]
+            weight = item["weight"]
+            label = _clean_normalized_label(item.get("label", ""))
             if not label:
-                label = _normalize_value_label(candidate)
-        elif target_type == "adjective":
-            label = _normalize_adjective(raw)
-        elif target_type == "one_word":
-            label = _normalize_one_word(raw)
-        elif target_type in {"brand", "destination"}:
-            label = _normalize_brand_destination(raw)
-        else:
-            label = _normalize_value_label(raw)
-        if not label:
-            if soft_prefer:
+                continue
+            label = _clean_normalized_label(_normalize_brand_destination(label))
+            counts[label] = counts.get(label, 0) + int(weight or 0)
+            if label not in examples:
+                examples[label] = []
+            if len(examples[label]) < 3:
+                examples[label].append(label)
+
+        for item in prepared:
+            raw = item["raw"]
+            weight = item["weight"]
+            ai_text = item["ai_text"]
+            result = norm_results.get(item["idx"], {})
+            label = _clean_normalized_label(result.get("label", "") or "")
+            is_general = bool(result.get("is_general", False))
+            is_non_response = bool(result.get("is_non_response", False)) and _is_explicit_non_response(raw)
+            geocode_label = _clean_normalized_label(item.get("geocode_label", "") or "")
+
+            if _destination_key(label) == "disney":
+                is_general = True
+                label = "Disney"
+
+            if is_non_response:
+                debug_stats["ai_non_response"] += 1
                 other_count += int(weight or 0)
-                if len(other_examples) < 3 and raw not in other_examples:
-                    other_examples.append(raw)
-            continue
-        counts[label] = counts.get(label, 0) + int(weight or 0)
-        if label not in examples:
-            examples[label] = []
-        if len(examples[label]) < 3 and raw not in examples[label]:
-            examples[label].append(raw)
+                if len(other_examples) < 3:
+                    other_examples.append("Non-response")
+                continue
+
+            if not label:
+                debug_stats["ai_empty"] += 1
+                fallback = _clean_normalized_label(item.get("fallback_label", "") or "")
+                if not fallback:
+                    fallback = _clean_normalized_label(_normalize_brand_destination(ai_text))
+                label = fallback
+                debug_stats["fallback_used"] += 1
+                if not label:
+                    if soft_prefer:
+                        other_count += int(weight or 0)
+                        if len(other_examples) < 3 and raw not in other_examples:
+                            other_examples.append(raw)
+                    continue
+
+            label = _clean_normalized_label(_normalize_brand_destination(label))
+            more_specific = _is_more_specific(label, geocode_label) if geocode_label else None
+            if geocode_label and (not label or label == geocode_label):
+                override_count += 1
+                if len(override_samples) < 8:
+                    override_samples.append({
+                        "raw": raw,
+                        "ai_label": label,
+                        "geocode_label": geocode_label,
+                        "is_general": is_general,
+                        "ai_has_attraction_kw": _contains_attraction_keyword(label),
+                        "geo_has_attraction_kw": _contains_attraction_keyword(geocode_label),
+                    })
+                label = geocode_label
+            if is_general or "(general)" in label.lower():
+                label = _force_general_suffix(label)
+            elif target_type == "destination":
+                label = _fuzzy_merge_destination(label, list(counts.keys()))
+            if any(k in raw.lower() for k in ("disney", "yosemite", "statue of liberty", "area 51")) and len(special_samples) < 12:
+                special_samples.append({
+                    "raw": raw,
+                    "ai_label": label,
+                    "geocode_label": geocode_label,
+                    "is_general": is_general,
+                    "more_specific": more_specific,
+                    "ai_text_source": item.get("ai_text_source"),
+                    "ai_text": item.get("ai_text"),
+                    "fallback_label": item.get("fallback_label"),
+                })
+
+            counts[label] = counts.get(label, 0) + int(weight or 0)
+            debug_stats["labels_added"] += 1
+            if label not in examples:
+                examples[label] = []
+            if len(examples[label]) < 3:
+                examples[label].append(label if target_type == "destination" else raw)
+
+        if len(counts) < 3:
+            fallback_labels = {}
+            for item in prepared:
+                raw = item["raw"]
+                if _is_explicit_non_response(raw):
+                    continue
+                fallback = _clean_normalized_label(item.get("fallback_label", "") or "")
+                if not fallback:
+                    continue
+                fallback_labels[fallback] = fallback_labels.get(fallback, 0) + int(item["weight"] or 0)
+            if fallback_labels:
+                counts = fallback_labels
+                examples = {k: [k] for k in list(counts.keys())[:50]}
+        if not counts:
+            for item in prepared:
+                raw = _clean_normalized_label(item["raw"])
+                if not raw or _is_explicit_non_response(raw):
+                    continue
+                counts[raw] = counts.get(raw, 0) + int(item["weight"] or 0)
+                examples.setdefault(raw, []).append(raw)
+    else:
+        for text, weight in zip(texts or [], freq or []):
+            raw = str(text or "").strip()
+            if not raw:
+                continue
+            label = ""
+            if target_type in {"city", "state", "country", "county", "location"}:
+                candidate = _extract_location_candidate(raw)
+                if normalize_locations and geocode_user_agent:
+                    if target_type == "country":
+                        label, _ = normalize_country(
+                            candidate,
+                            user_agent=geocode_user_agent,
+                            cache=geocode_cache,
+                            limiter=geocode_limiter,
+                        )
+                    elif target_type == "state":
+                        label, _ = normalize_state(
+                            candidate,
+                            user_agent=geocode_user_agent,
+                            cache=geocode_cache,
+                            limiter=geocode_limiter,
+                        )
+                    elif target_type == "county":
+                        label, _ = normalize_county(
+                            candidate,
+                            user_agent=geocode_user_agent,
+                            cache=geocode_cache,
+                            limiter=geocode_limiter,
+                        )
+                    elif target_type == "city":
+                        label, _ = normalize_city(
+                            candidate,
+                            user_agent=geocode_user_agent,
+                            cache=geocode_cache,
+                            limiter=geocode_limiter,
+                        )
+                    else:
+                        label, _ = normalize_location(
+                            candidate,
+                            user_agent=geocode_user_agent,
+                            cache=geocode_cache,
+                            limiter=geocode_limiter,
+                        )
+                if not label:
+                    label = _normalize_value_label(candidate)
+            elif target_type == "adjective":
+                label = _normalize_adjective(raw)
+            elif target_type == "one_word":
+                label = _normalize_one_word(raw)
+            elif target_type == "brand":
+                label = _normalize_brand_destination(raw)
+            else:
+                label = _normalize_value_label(raw)
+            if not label:
+                if soft_prefer:
+                    other_count += int(weight or 0)
+                    if len(other_examples) < 3 and raw not in other_examples:
+                        other_examples.append(raw)
+                continue
+            counts[label] = counts.get(label, 0) + int(weight or 0)
+            if label not in examples:
+                examples[label] = []
+            if len(examples[label]) < 3 and raw not in examples[label]:
+                examples[label].append(raw)
 
     if other_count > 0:
         counts["Other"] = counts.get("Other", 0) + other_count
@@ -374,8 +953,8 @@ def _build_guided_codeframe(
                 examples["Other"].append(ex)
 
     ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
-    max_subthemes = 50
-    if len(ordered) > max_subthemes:
+    max_subthemes = None
+    if max_subthemes and len(ordered) > max_subthemes:
         if any(lbl == "Other" for lbl, _ in ordered):
             ordered = [item for item in ordered if item[0] != "Other"][: max_subthemes - 1] + [
                 ("Other", counts.get("Other", 0))
@@ -384,7 +963,7 @@ def _build_guided_codeframe(
             ordered = ordered[:max_subthemes]
     total = sum(cnt for _, cnt in ordered) or 1
 
-    if target_type in {"city", "state", "country", "county", "location"}:
+    if target_type in {"city", "state", "country", "county", "location", "destination"}:
         if target_type == "country":
             major_label = "Countries"
             major_def = "Country categories derived from responses."
@@ -397,15 +976,15 @@ def _build_guided_codeframe(
         elif target_type == "city":
             major_label = "Cities"
             major_def = "City categories derived from responses."
+        elif target_type == "destination":
+            major_label = "Destinations"
+            major_def = "Destination categories derived from responses."
         else:
             major_label = "Locations"
             major_def = "Location categories derived from responses."
     elif target_type == "brand":
         major_label = "Brands"
         major_def = "Brand categories derived from responses."
-    elif target_type == "destination":
-        major_label = "Destinations"
-        major_def = "Destination categories derived from responses."
     elif target_type == "adjective":
         major_label = "Descriptors"
         major_def = "Adjective descriptors derived from responses."
@@ -470,6 +1049,8 @@ def build_theme_frame_with_progress(
     geocode_limiter: GeoRateLimiter | None = None,
     guidance_target_type: str | None = None,
     guidance_soft_prefer: bool = True,
+    normalization_question_text: str | None = None,
+    normalization_map: Dict[str, str] | None = None,
     on_status: Callable[[str], None] | None = None,
     on_progress: Callable[[int], None] | None = None,
     on_notice: Callable[[str], None] | None = None,
@@ -483,49 +1064,12 @@ def build_theme_frame_with_progress(
             on_progress(val)
 
     status("Preparing theme discovery...")
-    # #region agent log
-    try:
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H1",
-                "location": "pipeline/theme_discovery.py:build_theme_frame_with_progress:entry",
-                "message": "Theme discovery entry",
-                "data": {
-                    "text_count": len(texts or []),
-                    "guidance_len": len((guidance_text or "").strip()),
-                    "question_context_type": (question_context or {}).get("type"),
-                },
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-    # #endregion
     progress(10)
     filtered_data = [
         {"text": t, "weight": int(w)}
         for t, w in zip(texts, freq)
         if str(t or "").strip() != ""
     ]
-    # #region agent log
-    try:
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H2",
-                "location": "pipeline/theme_discovery.py:build_theme_frame_with_progress:filtered",
-                "message": "Filtered data ready",
-                "data": {
-                    "filtered_count": len(filtered_data),
-                    "force_chunking": True,
-                },
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-    # #endregion
     filtered_data.sort(key=lambda x: x["weight"], reverse=True)
 
     safe_limit = safe_prompt_token_budget(model, reserve_output_tokens=12_000)
@@ -549,28 +1093,6 @@ def build_theme_frame_with_progress(
             "- If a response does not fit the guidance, use a catch-all Other or Non-answer bucket.\n"
             "- Prefer concrete categories implied by guidance (e.g., cities, brands, destinations).\n"
         )
-    # #region agent log
-    try:
-        guidance_hash = ""
-        if guidance_text:
-            guidance_hash = hashlib.sha256(guidance_text.strip().encode("utf-8")).hexdigest()
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H16",
-                "location": "pipeline/theme_discovery.py:build_theme_frame_with_progress:prompt",
-                "message": "Enhanced prompt built",
-                "data": {
-                    "guidance_in_prompt": bool(guidance_text and guidance_text.strip()),
-                    "guidance_hash": guidance_hash,
-                    "prompt_len": len(enhanced_prompt),
-                },
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-    # #endregion
 
     if (not force_chunking) and (total_tokens <= safe_limit):
         payload = json.dumps(filtered_data, ensure_ascii=False, separators=(",", ":"))
@@ -646,48 +1168,10 @@ def build_theme_frame_with_progress(
     chunks = chunk_data(filtered_data, max_tokens=chunk_budget, model=model)
     all_themes = []
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-    # #region agent log
-    try:
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H10",
-                "location": "pipeline/theme_discovery.py:build_theme_frame_with_progress:chunking",
-                "message": "Chunking theme discovery",
-                "data": {
-                    "chunk_count": len(chunks),
-                    "filtered_count": len(filtered_data),
-                },
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-    # #endregion
 
     for i, chunk in enumerate(chunks, start=1):
         payload = json.dumps(chunk, ensure_ascii=False, separators=(",", ":"))
         user = enhanced_prompt + "\n\nWeighted responses (JSON array):\n" + payload
-        # #region agent log
-        try:
-            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "sessionId": "debug-session",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H11",
-                    "location": "pipeline/theme_discovery.py:build_theme_frame_with_progress:chunk_prompt",
-                    "message": "Chunk prompt ready",
-                    "data": {
-                        "chunk_index": i,
-                        "chunk_size": len(chunk),
-                        "user_len": len(user),
-                        "guidance_in_prompt": ("Guidance (must follow):" in user) or ("GUIDANCE:" in user),
-                    },
-                    "timestamp": int(time.time() * 1000),
-                }) + "\n")
-        except Exception:
-            pass
-        # #endregion
 
         def make_request():
             return oai_json_completion(
@@ -732,26 +1216,6 @@ def build_theme_frame_with_progress(
             cache_stats,
             f"Theme discovery chunk {i}",
         )
-        # #region agent log
-        try:
-            majors = data.get("major_themes", []) if isinstance(data, dict) else []
-            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "sessionId": "debug-session",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H12",
-                    "location": "pipeline/theme_discovery.py:build_theme_frame_with_progress:chunk_result",
-                    "message": "Chunk themes received",
-                    "data": {
-                        "chunk_index": i,
-                        "major_count": len(majors),
-                        "major_labels": [m.get("label", "") for m in majors][:8],
-                    },
-                    "timestamp": int(time.time() * 1000),
-                }) + "\n")
-        except Exception:
-            pass
-        # #endregion
         if repaired:
             usage["prompt_tokens"] += repair_usage.get("prompt_tokens", 0)
             usage["completion_tokens"] += repair_usage.get("completion_tokens", 0)
@@ -762,7 +1226,29 @@ def build_theme_frame_with_progress(
         progress(40 + int((i / len(chunks)) * 40))
 
     merged = merge_theme_chunks(all_themes, on_notice=on_notice)
-    if guidance_text and _guidance_mismatch(guidance_text, merged):
+    if guidance_target_type and guidance_target_type != "auto":
+        guided = _build_guided_codeframe(
+            texts,
+            freq,
+            guidance_text or "",
+            normalize_locations=normalize_locations,
+            geocode_user_agent=geocode_user_agent,
+            geocode_cache=geocode_cache or get_default_geocode_cache(),
+            geocode_limiter=geocode_limiter or get_default_geocode_limiter(),
+            guidance_target_type=guidance_target_type,
+            soft_prefer=guidance_soft_prefer,
+            client=client,
+            limiter=limiter,
+            cache=cache,
+            cache_stats=cache_stats,
+            seed=seed,
+            normalization_question_text=normalization_question_text,
+            normalization_map=normalization_map,
+        )
+        merged = guided
+        progress(100)
+        return guided, total_usage
+    elif guidance_text and _guidance_mismatch(guidance_text, merged):
         guided = _build_guided_codeframe(
             texts,
             freq,
@@ -773,45 +1259,15 @@ def build_theme_frame_with_progress(
             geocode_limiter=geocode_limiter or get_default_geocode_limiter(),
             guidance_target_type=guidance_target_type,
             soft_prefer=guidance_soft_prefer,
+            client=client,
+            limiter=limiter,
+            cache=cache,
+            cache_stats=cache_stats,
+            seed=seed,
+            normalization_question_text=normalization_question_text,
+            normalization_map=normalization_map,
         )
-        # #region agent log
-        try:
-            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-                f.write(json.dumps({
-                    "sessionId": "debug-session",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H17",
-                    "location": "pipeline/theme_discovery.py:build_theme_frame_with_progress:guided_fallback",
-                    "message": "Guided fallback applied",
-                    "data": {
-                        "expected_tokens": _guidance_expected_tokens(guidance_text),
-                        "major_count": len(guided.get("major_themes", [])),
-                        "sub_count": len((guided.get("major_themes", [{}])[0].get("subs", [])) if guided.get("major_themes") else []),
-                    },
-                    "timestamp": int(time.time() * 1000),
-                }) + "\n")
-        except Exception:
-            pass
-        # #endregion
         progress(100)
         return guided, total_usage
-    # #region agent log
-    try:
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H9",
-                "location": "pipeline/theme_discovery.py:build_theme_frame_with_progress:merged",
-                "message": "Merged theme labels",
-                "data": {
-                    "major_labels": [m.get("label", "") for m in (merged or [])][:10],
-                    "major_count": len(merged or []),
-                },
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-    # #endregion
     progress(100)
     return {"major_themes": merged}, total_usage

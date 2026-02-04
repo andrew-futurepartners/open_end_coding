@@ -101,39 +101,6 @@ def compute_prompt_version(system: str, user: str) -> str:
     return _hash_text(system + "\n" + user)
 
 
-_DEBUG_LOG_ENABLED = os.getenv("LLM_DEBUG_LOG", "").lower() in ("1", "true", "yes")
-_DEBUG_BUFFER: list[dict[str, Any]] = []
-_DEBUG_BUFFER_LOCK = threading.Lock()
-
-
-def _flush_debug_buffer() -> None:
-    if not _DEBUG_LOG_ENABLED:
-        return
-    with _DEBUG_BUFFER_LOCK:
-        if not _DEBUG_BUFFER:
-            return
-        try:
-            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-                for event in _DEBUG_BUFFER:
-                    f.write(json.dumps(event, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
-        finally:
-            _DEBUG_BUFFER.clear()
-
-
-def _log_debug_event(event: Dict[str, Any]) -> None:
-    if not _DEBUG_LOG_ENABLED:
-        return
-    with _DEBUG_BUFFER_LOCK:
-        _DEBUG_BUFFER.append(event)
-        if len(_DEBUG_BUFFER) >= 50:
-            _flush_debug_buffer()
-
-
-atexit.register(_flush_debug_buffer)
-
-
 class SQLiteCache:
     def __init__(self, path: str):
         self.path = path
@@ -251,29 +218,14 @@ def oai_json_completion(
     verbosity: str | None = "low",
     reserve_output_tokens: int = 8_000,
 ) -> Tuple[Dict[str, Any], Dict[str, int], str, bool]:
+    if model.startswith("gpt-5.2") and reasoning_effort == "minimal":
+        reasoning_effort = "low"
+
     prompt_version = compute_prompt_version(system, user)
     cache_key = build_cache_key(model, system, user, response_schema, seed, prompt_version)
 
     cached = cache.get(cache_key)
     if cached is not None:
-        # #region agent log
-        _log_debug_event({
-            "sessionId": "debug-session",
-            "runId": "pre-fix",
-            "hypothesisId": "H7",
-            "location": "pipeline/llm_client.py:oai_json_completion:cache_hit",
-            "message": "Cache hit",
-            "data": {
-                "model": model,
-                "prompt_version": prompt_version,
-                "user_len": len(user),
-                "has_guidance": ("GUIDANCE:" in user) or ("Guidance (must follow):" in user),
-                "has_weighted_responses": "Weighted responses" in user,
-                "has_candidate_list": "Candidate sub-themes" in user,
-            },
-            "timestamp": int(time.time() * 1000),
-        })
-        # #endregion
         cache_stats.hits += 1
         usage = cached.get("usage") or {}
         cache_stats.saved_prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
@@ -281,24 +233,6 @@ def oai_json_completion(
         return cached.get("parsed_json") or {}, usage, cached.get("raw_text") or "", True
 
     cache_stats.misses += 1
-    # #region agent log
-    _log_debug_event({
-        "sessionId": "debug-session",
-        "runId": "pre-fix",
-        "hypothesisId": "H8",
-        "location": "pipeline/llm_client.py:oai_json_completion:cache_miss",
-        "message": "Cache miss",
-        "data": {
-            "model": model,
-            "prompt_version": prompt_version,
-            "user_len": len(user),
-            "has_guidance": ("GUIDANCE:" in user) or ("Guidance (must follow):" in user),
-            "has_weighted_responses": "Weighted responses" in user,
-            "has_candidate_list": "Candidate sub-themes" in user,
-        },
-        "timestamp": int(time.time() * 1000),
-    })
-    # #endregion
 
     schema_str = ""
     if response_schema:

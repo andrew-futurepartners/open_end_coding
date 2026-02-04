@@ -69,6 +69,39 @@ Theme dictionary:
 """
 )
 
+_ATTRACTION_KEYWORDS = {
+    "park",
+    "canyon",
+    "resort",
+    "memorial",
+    "monument",
+    "museum",
+    "trail",
+    "bridge",
+    "island",
+    "beach",
+    "lake",
+    "mount",
+    "mountain",
+    "falls",
+    "valley",
+    "forest",
+    "zoo",
+    "aquarium",
+    "stadium",
+    "arena",
+    "statue",
+    "tower",
+    "national park",
+    "historic",
+    "landmark",
+}
+
+
+def _contains_attraction_keyword(label: str) -> bool:
+    text = (label or "").lower()
+    return any(k in text for k in _ATTRACTION_KEYWORDS)
+
 
 def govern_theme_dict(
     client,
@@ -83,26 +116,6 @@ def govern_theme_dict(
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, int]]:
     if not theme_dict or not theme_dict.get("major_themes"):
         return theme_dict, [], {"prompt_tokens": 0, "completion_tokens": 0}
-
-    # #region agent log
-    try:
-        majors_in = theme_dict.get("major_themes", []) if isinstance(theme_dict, dict) else []
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H13",
-                "location": "pipeline/governance.py:govern_theme_dict:input",
-                "message": "Governance input themes",
-                "data": {
-                    "major_count": len(majors_in),
-                    "major_labels": [m.get("label", "") for m in majors_in][:8],
-                },
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
-    except Exception:
-        pass
-    # #endregion
 
     theme_json = json.dumps(theme_dict, ensure_ascii=False, separators=(",", ":"))
     qc_text = json.dumps(question_context or {}, ensure_ascii=False, separators=(",", ":"))
@@ -164,27 +177,69 @@ def govern_theme_dict(
 
     governed = apply_governance_change_log(theme_dict, proposed_theme_dict, change_log)
     governed = normalize_theme_dict_order(governed)
-
-    # #region agent log
+    # Restore dropped attraction/landmark labels (guard against over-merge).
     try:
-        majors_out = governed.get("major_themes", []) if isinstance(governed, dict) else []
-        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": "H14",
-                "location": "pipeline/governance.py:govern_theme_dict:output",
-                "message": "Governance output themes",
-                "data": {
-                    "major_count": len(majors_out),
-                    "major_labels": [m.get("label", "") for m in majors_out][:8],
-                    "change_log_count": len(change_log or []),
-                },
-                "timestamp": int(time.time() * 1000),
-            }) + "\n")
+        input_map: Dict[str, Dict[str, Any]] = {}
+        input_major_for: Dict[str, str] = {}
+        for m in (theme_dict.get("major_themes", []) if isinstance(theme_dict, dict) else []):
+            mid = m.get("id")
+            for s in (m.get("subs", []) or []):
+                lbl = (s.get("label") or "").strip()
+                if lbl:
+                    input_map[lbl.lower()] = s
+                    if mid:
+                        input_major_for[lbl.lower()] = mid
+        output_labels = set()
+        output_by_id: Dict[str, Dict[str, Any]] = {}
+        for m in (governed.get("major_themes", []) if isinstance(governed, dict) else []):
+            for s in (m.get("subs", []) or []):
+                lbl = (s.get("label") or "").strip()
+                if lbl:
+                    output_labels.add(lbl.lower())
+                sid = str(s.get("id", "") or "")
+                if sid and sid not in output_by_id:
+                    output_by_id[sid] = s
+        restored = []
+        relabeled = []
+        for lbl_key, sub in input_map.items():
+            label_text = sub.get("label", "") or ""
+            is_general = "(general)" in label_text.lower()
+            if lbl_key not in output_labels and (_contains_attraction_keyword(label_text) or is_general):
+                sid = str(sub.get("id", "") or "")
+                existing = output_by_id.get(sid) if sid else None
+                if existing and is_general:
+                    existing_label = (existing.get("label") or "")
+                    if "(general)" not in existing_label.lower():
+                        existing["label"] = label_text
+                        relabeled.append(f"{existing_label} -> {label_text}")
+                    continue
+                mid = input_major_for.get(lbl_key)
+                if not mid:
+                    continue
+                target_major = next((m for m in governed.get("major_themes", []) or [] if m.get("id") == mid), None)
+                if not target_major:
+                    continue
+                target_major.setdefault("subs", []).append(sub)
+                restored.append(sub.get("label", ""))
+        if restored:
+            # De-duplicate by ID after restoring to avoid duplicate labels for same subtheme.
+            try:
+                for m in (governed.get("major_themes", []) if isinstance(governed, dict) else []):
+                    seen_ids = set()
+                    deduped = []
+                    for s in (m.get("subs", []) or []):
+                        sid = str(s.get("id", "") or "")
+                        if sid and sid in seen_ids:
+                            continue
+                        if sid:
+                            seen_ids.add(sid)
+                        deduped.append(s)
+                    m["subs"] = deduped
+            except Exception:
+                pass
+            governed = normalize_theme_dict_order(governed)
     except Exception:
         pass
-    # #endregion
 
     ok, err = validate_json_schema(governed, THEME_SCHEMA)
     if not ok:
