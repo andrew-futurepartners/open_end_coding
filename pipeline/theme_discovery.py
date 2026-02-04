@@ -460,8 +460,11 @@ _EXPLICIT_NON_RESPONSE = {
     "no",
     "not applicable",
     "not sure",
+    "unsure",
     "dont know",
     "don't know",
+    "i dont know",
+    "i don't know",
     "unknown",
     "prefer not",
     "prefer not to say",
@@ -472,7 +475,13 @@ _EXPLICIT_NON_RESPONSE = {
 
 def _is_explicit_non_response(raw: str) -> bool:
     text = " ".join(str(raw or "").strip().lower().split())
-    return text in _EXPLICIT_NON_RESPONSE
+    in_set = text in _EXPLICIT_NON_RESPONSE
+    if not in_set:
+        if text.startswith(("dont know", "don't know", "i dont know", "i don't know")):
+            in_set = True
+        elif text.startswith("unsure"):
+            in_set = True
+    return in_set
 
 
 def _force_general_suffix(label: str) -> str:
