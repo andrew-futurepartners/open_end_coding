@@ -2055,6 +2055,7 @@ def assign_codes_two_stage(
     cache = get_llm_cache()
     cache_stats = get_cache_stats()
     guidance_text = st.session_state.get(f"question_guidance::{question_text}", "").strip() if "question_text" in globals() else ""
+    normalization_map = st.session_state.get("destination_normalization_map")
     return pipeline_assign_codes_two_stage(
         client,
         model,
@@ -2071,6 +2072,7 @@ def assign_codes_two_stage(
         on_status=status_text.text if status_text else None,
         on_progress=progress_bar.progress if progress_bar else None,
         guidance_text=guidance_text,
+        normalization_map=normalization_map,
     )
 
 
@@ -2191,11 +2193,57 @@ def verify_low_confidence(
 
 def analyze_theme_distribution(coded_df: pd.DataFrame, tiny_threshold: float, theme_dict: Dict[str, Any] = None) -> Dict[str, Any]:
     """Analyze theme distribution and identify potential issues with outlier handling"""
-    prefixes = [question_label if len(text_cols) == 1 else f"{question_label}_{col}" for col in text_cols]
+    if "_column_prefix" in globals():
+        prefixes = [_column_prefix(col) for col in text_cols]
+    else:
+        prefixes = [question_label if len(text_cols) == 1 else f"{question_label}_{col}" for col in text_cols]
     minor_cols = [f"{p}_MinorTheme1" for p in prefixes]
     oe_cols = [f"{p}_OE" for p in prefixes]
-    minor_series = pd.concat([coded_df[c] for c in minor_cols], ignore_index=True)
-    oe_series = pd.concat([coded_df[c] for c in oe_cols], ignore_index=True)
+    existing_minor_cols = [c for c in minor_cols if c in coded_df.columns]
+    existing_oe_cols = [c for c in oe_cols if c in coded_df.columns]
+
+    # region agent log
+    try:
+        debug_log_path = r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log"
+        payload = {
+            "sessionId": "debug-session",
+            "runId": "pre-fix",
+            "hypothesisId": "H8",
+            "location": "app_v1.py:analyze_theme_distribution:columns",
+            "message": "Theme distribution column availability",
+            "data": {
+                "minor_cols": minor_cols,
+                "oe_cols": oe_cols,
+                "missing_minor": [c for c in minor_cols if c not in coded_df.columns],
+                "missing_oe": [c for c in oe_cols if c not in coded_df.columns],
+            },
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(debug_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # endregion
+
+    if not existing_minor_cols or not existing_oe_cols:
+        return {
+            "total_responses": 0,
+            "other_count": 0,
+            "other_percent": 0.0,
+            "not_applicable_count": 0,
+            "not_applicable_percent": 0.0,
+            "manual_review_count": 0,
+            "manual_review_percent": 0.0,
+            "tiny_theme_count": 0,
+            "tiny_theme_percent": 0.0,
+            "tiny_theme_names": [],
+            "threshold_exceeded": False,
+            "coverage_analysis": {},
+            "recommendations": [],
+        }
+
+    minor_series = pd.concat([coded_df[c] for c in existing_minor_cols], ignore_index=True)
+    oe_series = pd.concat([coded_df[c] for c in existing_oe_cols], ignore_index=True)
     total_responses = int(oe_series.notna().sum())
     
     # Count responses in different categories
@@ -2220,7 +2268,27 @@ def analyze_theme_distribution(coded_df: pd.DataFrame, tiny_threshold: float, th
     # Check coverage estimates vs actual if theme_dict provided
     coverage_analysis = {}
     if theme_dict:
-        coverage_analysis = analyze_coverage_accuracy(coded_df, theme_dict)
+        try:
+            coverage_analysis = analyze_coverage_accuracy(coded_df, theme_dict)
+        except Exception as exc:
+            # region agent log
+            try:
+                debug_log_path = r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log"
+                payload = {
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H10",
+                    "location": "app_v1.py:analyze_theme_distribution:coverage_error",
+                    "message": "Coverage analysis failed",
+                    "data": {"error": str(exc)},
+                    "timestamp": int(time.time() * 1000),
+                }
+                with open(debug_log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+            # endregion
+            coverage_analysis = {}
     
     # Analysis results
     analysis = {
@@ -2423,11 +2491,43 @@ def analyze_coverage_accuracy(coded_df: pd.DataFrame, theme_dict: Dict[str, Any]
     if not theme_dict or "major_themes" not in theme_dict:
         return {}
     
-    prefixes = [question_label if len(text_cols) == 1 else f"{question_label}_{col}" for col in text_cols]
+    if "_column_prefix" in globals():
+        prefixes = [_column_prefix(col) for col in text_cols]
+    else:
+        prefixes = [question_label if len(text_cols) == 1 else f"{question_label}_{col}" for col in text_cols]
     minor_cols = [f"{p}_MinorTheme1" for p in prefixes]
     oe_cols = [f"{p}_OE" for p in prefixes]
-    minor_series = pd.concat([coded_df[c] for c in minor_cols], ignore_index=True)
-    oe_series = pd.concat([coded_df[c] for c in oe_cols], ignore_index=True)
+    existing_minor_cols = [c for c in minor_cols if c in coded_df.columns]
+    existing_oe_cols = [c for c in oe_cols if c in coded_df.columns]
+
+    # region agent log
+    try:
+        debug_log_path = r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log"
+        payload = {
+            "sessionId": "debug-session",
+            "runId": "pre-fix",
+            "hypothesisId": "H9",
+            "location": "app_v1.py:analyze_coverage_accuracy:columns",
+            "message": "Coverage column availability",
+            "data": {
+                "minor_cols": minor_cols,
+                "oe_cols": oe_cols,
+                "missing_minor": [c for c in minor_cols if c not in coded_df.columns],
+                "missing_oe": [c for c in oe_cols if c not in coded_df.columns],
+            },
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(debug_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # endregion
+
+    if not existing_minor_cols or not existing_oe_cols:
+        return {}
+
+    minor_series = pd.concat([coded_df[c] for c in existing_minor_cols], ignore_index=True)
+    oe_series = pd.concat([coded_df[c] for c in existing_oe_cols], ignore_index=True)
     total_responses = int(oe_series.notna().sum())
     coverage_results = []
     
@@ -2626,14 +2726,18 @@ df.columns = [str(c).strip() for c in df.columns]
 st.write("**Select open‑end column(s)**")
 group_mode = st.radio(
     "Column grouping",
-    ["Single column", "Auto-group by prefix", "Manual multi-select"],
+    ["Single column", "Auto-group multi-select", "Manual multi-select"],
     horizontal=True,
 )
 
 def _infer_group_key(col_name: str) -> str:
     cleaned = str(col_name or "").strip()
     cleaned = re.sub(r"\s*\(.*?\)\s*$", "", cleaned)
-    cleaned = re.sub(r"[\s_-]*(?:\d+|[A-Za-z])\s*$", "", cleaned).strip()
+    cleaned = re.sub(r"\.\d+$", "", cleaned).strip()
+    cleaned = re.sub(r"(?:r|R)\d+(?=\s*:)", "", cleaned).strip()
+    cleaned = re.sub(r"(?:r|R)\d+\s*$", "", cleaned).strip()
+    cleaned = re.sub(r"[\s_-]+[A-Za-z]\s*$", "", cleaned).strip()
+    cleaned = re.sub(r"[\s_-]+\d+\s*$", "", cleaned).strip()
     return cleaned if cleaned else str(col_name or "").strip()
 
 text_cols: List[str] = []
@@ -2650,7 +2754,7 @@ else:
         grouped.setdefault(key, []).append(col)
     grouped = {k: v for k, v in grouped.items() if len(v) > 1}
 
-    if group_mode == "Auto-group by prefix":
+    if group_mode == "Auto-group multi-select":
         if grouped:
             group_label = st.selectbox("Auto-grouped question", options=sorted(grouped.keys()))
             text_cols = grouped.get(group_label, [])
@@ -2668,6 +2772,29 @@ else:
 
 if not text_cols:
     st.stop()
+
+# Build safe, short suffixes for multi-column exports
+def _build_col_suffix_map(cols: List[str]) -> Dict[str, str]:
+    seen: Dict[str, int] = {}
+    suffix_map: Dict[str, str] = {}
+    for idx, col in enumerate(cols):
+        raw = str(col or "").strip()
+        cleaned = re.sub(r"[\r\n\t]+", " ", raw)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        key = _infer_group_key(cleaned)
+        if key and cleaned.lower().startswith(key.lower()):
+            cleaned = cleaned[len(key):].strip(" _-")
+        cleaned = re.sub(r"\s+", "_", cleaned)
+        cleaned = re.sub(r"[^A-Za-z0-9_]+", "", cleaned)
+        suffix = cleaned if cleaned else str(idx + 1)
+        count = seen.get(suffix, 0) + 1
+        seen[suffix] = count
+        if count > 1:
+            suffix = f"{suffix}_{count}"
+        suffix_map[col] = suffix
+    return suffix_map
+
+col_suffix_map = _build_col_suffix_map(text_cols)
 
 # Reset downstream results if the uploaded file or selected columns changed
 _input_sig = (uploaded.name, getattr(uploaded, "size", None), tuple(text_cols))
@@ -3248,8 +3375,59 @@ label_map = {r["ThemeID"]: r["Label"] for _, r in theme_df.iterrows()}
 parent_map = {r["ThemeID"]: r["ParentThemeID"] for _, r in theme_df.iterrows()}
 theme_levels = {r["ThemeID"]: r["Level"] for _, r in theme_df.iterrows()}
 
+debug_log_path = r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log"
+
+def _debug_log(hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    try:
+        payload = {
+            "sessionId": "debug-session",
+            "runId": "pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(debug_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def _norm_label(x: str) -> str:
+    return re.sub(r"\s+", " ", (x or "").strip().lower())
+
+# region agent log
+try:
+    normalization_map = st.session_state.get("destination_normalization_map") or {}
+    intl_ids = [tid for tid, lbl in label_map.items() if "international destination" in _norm_label(lbl)]
+    intl_assigned = []
+    for idx, item in assign_map.items():
+        assigns = item.get("assignments", []) or []
+        if any(a.get("theme_id") in intl_ids for a in assigns):
+            intl_assigned.append({"idx": idx, "theme_ids": [a.get("theme_id") for a in assigns]})
+            if len(intl_assigned) >= 5:
+                break
+
+    _debug_log(
+        "H6",
+        "app_v1.py:export:coded_df_snapshot",
+        "International assignments before export",
+        {
+            "assigned_raw_count": len(assign_map),
+            "intl_ids": intl_ids,
+            "intl_assigned_sample": intl_assigned,
+            "normalization_map_size": len(normalization_map),
+        },
+    )
+except Exception:
+    pass
+# endregion
+
 def _column_prefix(col_name: str) -> str:
-    return question_label if len(text_cols) == 1 else f"{question_label}_{col_name}"
+    if len(text_cols) == 1:
+        return question_label
+    suffix = col_suffix_map.get(col_name, str(text_cols.index(col_name) + 1) if col_name in text_cols else "1")
+    return f"{question_label}_{suffix}"
 
 assigned_by_col: Dict[str, Dict[int, Dict[str, Any]]] = {col: {} for col in text_cols}
 for idx, meta in enumerate(index_map):
@@ -3297,6 +3475,26 @@ for i in range(len(df)):
     coded_rows.append(row)
 
 coded_df = pd.DataFrame(coded_rows)
+
+# region agent log
+try:
+    intl_cols = [c for c in coded_df.columns if "MinorTheme" in c]
+    intl_mask = pd.Series(False, index=coded_df.index)
+    for c in intl_cols:
+        intl_mask = intl_mask | coded_df[c].astype(str).str.contains("International Destination", case=False, na=False)
+    _debug_log(
+        "H7",
+        "app_v1.py:export:coded_df_international",
+        "International labels in coded_df",
+        {
+            "rows_with_international": int(intl_mask.sum()),
+            "sample_rows": coded_df.loc[intl_mask, intl_cols].head(3).to_dict(orient="records"),
+            "intl_label_map": {k: v for k, v in label_map.items() if "international destination" in _norm_label(v)},
+        },
+    )
+except Exception:
+    pass
+# endregion
 
 # Order columns
 id_before = pass_id_cols.copy()

@@ -175,8 +175,120 @@ def govern_theme_dict(
     proposed_theme_dict = data.get("theme_dict", {})
     change_log = normalize_change_log(data.get("change_log", []))
 
+    # #region agent log
+    try:
+        def _collect_otherish(tdict: Dict[str, Any]) -> List[Dict[str, str]]:
+            hits = []
+            for m in (tdict.get("major_themes", []) if isinstance(tdict, dict) else []):
+                for s in (m.get("subs", []) or []):
+                    lbl = (s.get("label") or "").strip()
+                    if any(k in lbl.lower() for k in ("other", "unclear", "invalid")):
+                        hits.append({"id": str(s.get("id", "")), "label": lbl})
+            return hits
+        other_in = _collect_otherish(theme_dict)
+        other_prop = _collect_otherish(proposed_theme_dict)
+        other_changes = []
+        for ch in (change_log or []):
+            to_ids = [str(i) for i in (ch.get("to_ids") or [])]
+            action = ch.get("action")
+            if action == "rename":
+                other_changes.append({
+                    "action": action,
+                    "from_ids": ch.get("from_ids", []),
+                    "to_ids": to_ids,
+                    "reason": ch.get("reason", ""),
+                })
+        if other_in or other_prop or other_changes:
+            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H3",
+                    "location": "pipeline/governance.py:govern_theme_dict:otherish",
+                    "message": "Other/unclear labels in governance",
+                    "data": {
+                        "input_otherish": other_in[:6],
+                        "proposed_otherish": other_prop[:6],
+                        "change_log_actions": other_changes[:6],
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+    # #region agent log
+    try:
+        def _has_international(tdict: Dict[str, Any]) -> bool:
+            for m in (tdict.get("major_themes", []) if isinstance(tdict, dict) else []):
+                for s in (m.get("subs", []) or []):
+                    lbl = (s.get("label") or "").lower()
+                    if "international destination" in lbl:
+                        return True
+            return False
+        in_international = _has_international(theme_dict)
+        out_international = _has_international(proposed_theme_dict)
+        if in_international or out_international:
+            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H1",
+                    "location": "pipeline/governance.py:govern_theme_dict:international_presence",
+                    "message": "International destination label presence",
+                    "data": {
+                        "input_has_international": in_international,
+                        "output_has_international": out_international,
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
     governed = apply_governance_change_log(theme_dict, proposed_theme_dict, change_log)
     governed = normalize_theme_dict_order(governed)
+    # Move unclear/fragment/invalid sub-themes to Non-answer.
+    try:
+        otherish_keywords = ("unclear", "fragment", "invalid", "nonsense", "non-response", "non response")
+        majors = governed.get("major_themes", []) if isinstance(governed, dict) else []
+        nonanswer_major = next((m for m in majors if (m.get("label", "") or "").lower() == "non-answer"), None)
+        if nonanswer_major is None:
+            nonanswer_major = next((m for m in majors if (m.get("label", "") or "").lower() == "nonanswer"), None)
+        moved = []
+        if nonanswer_major is not None:
+            for m in majors:
+                if m is nonanswer_major:
+                    continue
+                subs = list(m.get("subs", []) or [])
+                keep = []
+                for s in subs:
+                    lbl = (s.get("label", "") or "")
+                    if any(k in lbl.lower() for k in otherish_keywords):
+                        nonanswer_major.setdefault("subs", []).append(s)
+                        moved.append(lbl)
+                    else:
+                        keep.append(s)
+                m["subs"] = keep
+            if moved:
+                governed = normalize_theme_dict_order(governed)
+                # #region agent log
+                try:
+                    with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "sessionId": "debug-session",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H5",
+                            "location": "pipeline/governance.py:govern_theme_dict:move_otherish",
+                            "message": "Moved unclear/fragment labels to Non-answer",
+                            "data": {"moved": moved[:8], "count": len(moved)},
+                            "timestamp": int(time.time() * 1000),
+                        }) + "\n")
+                except Exception:
+                    pass
+                # #endregion
+    except Exception:
+        pass
     # Restore dropped attraction/landmark labels (guard against over-merge).
     try:
         input_map: Dict[str, Dict[str, Any]] = {}

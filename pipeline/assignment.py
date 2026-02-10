@@ -122,6 +122,7 @@ def assign_codes_two_stage(
     on_status: Callable[[str], None] | None = None,
     on_progress: Callable[[int], None] | None = None,
     guidance_text: str | None = None,
+    normalization_map: Dict[str, str] | None = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     def status(msg: str) -> None:
         if on_status:
@@ -136,6 +137,47 @@ def assign_codes_two_stage(
     progress(5)
 
     theme_dict = ensure_nonanswer_theme(theme_dict)
+
+    debug_log_path = r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log"
+
+    def _debug_log(hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+        try:
+            payload = {
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": int(time.time() * 1000),
+            }
+            with open(debug_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _find_international_subthemes(src_theme_dict: Dict[str, Any]) -> List[Dict[str, str]]:
+        matches: List[Dict[str, str]] = []
+        for major in src_theme_dict.get("major_themes", []) or []:
+            for sub in (major.get("subs") or []):
+                label = str(sub.get("label", ""))
+                if "international destination" in label.lower():
+                    matches.append({"id": str(sub.get("id", "")), "label": label})
+        return matches
+
+    # region agent log
+    _debug_log(
+        "H4",
+        "pipeline/assignment.py:assign_codes_two_stage:entry",
+        "Assignment entry snapshot",
+        {
+            "rows": len(rows),
+            "normalization_map_size": len(normalization_map or {}),
+            "international_subthemes": _find_international_subthemes(theme_dict),
+            "guidance_len": len(guidance_text or ""),
+        },
+    )
+    # endregion
 
     def _norm(x: str) -> str:
         return re.sub(r"[^a-z]+", "", (x or "").lower())
@@ -201,6 +243,22 @@ def assign_codes_two_stage(
         subtheme_texts = [r["text"] for r in subtheme_records]
         subtheme_label_by_id = {r.get("id"): r.get("label", "") for r in subtheme_records if r.get("id")}
 
+        # region agent log
+        _debug_log(
+            "H3",
+            "pipeline/assignment.py:assign_codes_two_stage:subtheme_records",
+            "International subtheme records",
+            {
+                "matches": [
+                    {"id": r.get("id", ""), "label": r.get("label", "")}
+                    for r in subtheme_records
+                    if "international destination" in str(r.get("label", "")).lower()
+                ],
+                "total_subthemes": len(subtheme_records),
+            },
+        )
+        # endregion
+
         cache_key = f"embeddings::{theme_signature(theme_dict)}::{embedding_model}"
         cached = cache.get(cache_key)
         if cached and cached.get("parsed_json"):
@@ -216,6 +274,76 @@ def assign_codes_two_stage(
         response_embeddings = np.array(response_embeddings_list, dtype=float)
 
         candidate_lists = get_candidate_ids(response_embeddings, subtheme_embeddings, subtheme_ids, top_k=top_k)
+
+        def _norm_label(x: str) -> str:
+            return re.sub(r"\s+", " ", (x or "").strip().lower())
+
+        label_to_id = {
+            _norm_label(r.get("label", "")): r.get("id")
+            for r in subtheme_records
+            if r.get("label") and r.get("id")
+        }
+
+        if normalization_map:
+            augmented = 0
+            for i, text in enumerate(substantive_texts):
+                mapped_label = normalization_map.get(text)
+                if not mapped_label:
+                    continue
+                mapped_id = label_to_id.get(_norm_label(mapped_label))
+                if mapped_id and mapped_id not in candidate_lists[i]:
+                    candidate_lists[i] = [mapped_id] + list(candidate_lists[i])
+                    augmented += 1
+
+            # region agent log
+            _debug_log(
+                "H1",
+                "pipeline/assignment.py:assign_codes_two_stage:augment_candidates",
+                "Augmented candidate lists with normalization-mapped labels",
+                {"augmented_count": augmented},
+            )
+            # endregion
+
+        # region agent log
+        if normalization_map:
+            intl_targets = []
+            for text in substantive_texts:
+                mapped = normalization_map.get(text)
+                if mapped and "international destination" in mapped.lower():
+                    intl_targets.append(text)
+            sampled = intl_targets[:5]
+            text_to_candidates = {t: c for t, c in zip(substantive_texts, candidate_lists)}
+            intl_candidates = []
+            intl_id = None
+            intl_subs = _find_international_subthemes(theme_dict)
+            if intl_subs:
+                intl_id = intl_subs[0].get("id") or None
+            for t in sampled:
+                candidates = text_to_candidates.get(t, [])
+                intl_candidates.append({
+                    "text": str(t)[:120],
+                    "mapped": normalization_map.get(t),
+                    "has_international_candidate": bool(intl_id and intl_id in candidates),
+                    "candidate_ids": candidates[:10],
+                })
+            _debug_log(
+                "H1",
+                "pipeline/assignment.py:assign_codes_two_stage:candidate_lists",
+                "Candidate lists for international-mapped texts",
+                {
+                    "intl_id": intl_id,
+                    "sample_count": len(sampled),
+                    "samples": intl_candidates,
+                },
+            )
+        else:
+            _debug_log(
+                "H2",
+                "pipeline/assignment.py:assign_codes_two_stage:candidate_lists",
+                "Normalization map missing in assignment",
+                {"normalization_map": None},
+            )
+        # endregion
 
         for text, candidates in zip(substantive_texts, candidate_lists):
             normalized_candidates = normalize_candidate_ids(candidates)
@@ -342,6 +470,25 @@ def assign_codes_two_stage(
                         low_thresh,
                     )
                     text_to_assignment[text].update(normalized)
+
+                    # region agent log
+                    if normalization_map:
+                        mapped_label = normalization_map.get(text)
+                        if mapped_label and "international destination" in str(mapped_label).lower():
+                            _debug_log(
+                                "H5",
+                                "pipeline/assignment.py:assign_codes_two_stage:normalized_result",
+                                "Assignment result for international-mapped text",
+                                {
+                                    "text": str(text)[:120],
+                                    "mapped": mapped_label,
+                                    "candidate_ids": candidate_ids,
+                                    "result_subtheme_ids": normalized.get("subtheme_ids", []),
+                                    "confidence": normalized.get("confidence", 0.0),
+                                    "decision": normalized.get("decision", ""),
+                                },
+                            )
+                    # endregion
 
             completed_groups += 1
             progress(40 + int((completed_groups / total_groups) * 50))

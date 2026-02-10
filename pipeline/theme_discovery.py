@@ -399,6 +399,27 @@ def _fuzzy_merge_destination(label: str, existing_labels: List[str]) -> str:
             best_score = score
             best_label = existing
     if best_score >= DESTINATION_FUZZY_THRESHOLD:
+        # #region agent log
+        try:
+            intl_terms = ("international", "paris", "eiffel", "london", "rome", "madrid", "spain", "france", "italy", "tokyo", "japan", "china", "india", "dubai", "mexico", "canada", "europe", "asia", "africa", "australia")
+            if any(t in (label or "").lower() for t in intl_terms) or any(t in (best_label or "").lower() for t in intl_terms):
+                with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "sessionId": "debug-session",
+                        "runId": "pre-fix",
+                        "hypothesisId": "H2",
+                        "location": "pipeline/theme_discovery.py:_fuzzy_merge_destination",
+                        "message": "Fuzzy merge for international-like label",
+                        "data": {
+                            "label": label,
+                            "best_label": best_label,
+                            "best_score": best_score,
+                        },
+                        "timestamp": int(time.time() * 1000),
+                    }) + "\n")
+        except Exception:
+            pass
+        # #endregion
         return best_label
     return label
 
@@ -487,9 +508,9 @@ def _is_explicit_non_response(raw: str) -> bool:
 def _force_general_suffix(label: str) -> str:
     if not label:
         return ""
-    if "(general)" in label.lower():
-        return label
-    return f"{label} (General)"
+    # Always normalize to " (General)" with capital G.
+    cleaned = re.sub(r"\s*\(general\)\s*$", "", label, flags=re.IGNORECASE).strip()
+    return f"{cleaned} (General)" if cleaned else ""
 
 
 def _build_destination_batches(
@@ -661,6 +682,9 @@ def _build_guided_codeframe(
     examples: Dict[str, List[str]] = {}
     other_examples: List[str] = []
     other_count = 0
+    non_answer_count = 0
+    non_answer_examples: List[str] = []
+    intl_samples: List[Dict[str, Any]] = []
     if target_type in {"destination", "location", "city", "state", "country", "county", "brand", "adjective", "one_word", "general"}:
         prepared: List[Dict[str, Any]] = []
         resolved: List[Dict[str, Any]] = []
@@ -811,9 +835,9 @@ def _build_guided_codeframe(
 
             if is_non_response:
                 debug_stats["ai_non_response"] += 1
-                other_count += int(weight or 0)
-                if len(other_examples) < 3:
-                    other_examples.append("Non-response")
+                non_answer_count += int(weight or 0)
+                if len(non_answer_examples) < 3:
+                    non_answer_examples.append(raw or "Non-response")
                 continue
 
             if not label:
@@ -848,6 +872,40 @@ def _build_guided_codeframe(
                 label = _force_general_suffix(label)
             elif target_type == "destination":
                 label = _fuzzy_merge_destination(label, list(counts.keys()))
+
+            # #region agent log
+            try:
+                raw_lc = (raw or "").lower()
+                intl_terms = ("international", "paris", "eiffel", "london", "rome", "madrid", "spain", "france", "italy", "tokyo", "japan", "china", "india", "dubai", "mexico", "canada", "europe", "asia", "africa", "australia")
+                if any(t in raw_lc for t in intl_terms) and len(intl_samples) < 8:
+                    intl_samples.append({
+                        "raw": raw,
+                        "label": label,
+                        "ai_label": _clean_normalized_label(result.get("label", "") or ""),
+                        "is_non_response": is_non_response,
+                        "geocode_label": geocode_label,
+                        "ai_text": item.get("ai_text"),
+                    })
+                if any(t in raw_lc for t in intl_terms) and "international destination (general)" not in (label or "").lower():
+                    with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "sessionId": "debug-session",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H6",
+                            "location": "pipeline/theme_discovery.py:_build_guided_codeframe:intl_mismatch",
+                            "message": "International raw not mapped to International Destination (General)",
+                            "data": {
+                                "raw": raw,
+                                "label": label,
+                                "ai_label": _clean_normalized_label(result.get("label", "") or ""),
+                                "geocode_label": geocode_label,
+                                "ai_text": item.get("ai_text"),
+                            },
+                            "timestamp": int(time.time() * 1000),
+                        }) + "\n")
+            except Exception:
+                pass
+            # #endregion
             if any(k in raw.lower() for k in ("disney", "yosemite", "statue of liberty", "area 51")) and len(special_samples) < 12:
                 special_samples.append({
                     "raw": raw,
@@ -859,6 +917,32 @@ def _build_guided_codeframe(
                     "ai_text": item.get("ai_text"),
                     "fallback_label": item.get("fallback_label"),
                 })
+
+            # #region agent log
+            try:
+                label_lc = (label or "").lower()
+                if any(k in label_lc for k in ("other", "unclear", "invalid")):
+                    with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "sessionId": "debug-session",
+                            "runId": "pre-fix",
+                            "hypothesisId": "H1",
+                            "location": "pipeline/theme_discovery.py:_build_guided_codeframe:label_other",
+                            "message": "Other/unclear label in destinations",
+                            "data": {
+                                "raw": raw,
+                                "label": label,
+                                "ai_label": _clean_normalized_label(result.get("label", "") or ""),
+                                "is_non_response_flag": bool(result.get("is_non_response", False)),
+                                "explicit_non_response": _is_explicit_non_response(raw),
+                                "fallback_label": _clean_normalized_label(item.get("fallback_label", "") or ""),
+                                "ai_text": item.get("ai_text"),
+                            },
+                            "timestamp": int(time.time() * 1000),
+                        }) + "\n")
+            except Exception:
+                pass
+            # #endregion
 
             counts[label] = counts.get(label, 0) + int(weight or 0)
             debug_stats["labels_added"] += 1
@@ -961,6 +1045,30 @@ def _build_guided_codeframe(
             if ex not in examples["Other"]:
                 examples["Other"].append(ex)
 
+    # #region agent log
+    try:
+        if non_answer_count > 0 or other_count > 0:
+            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H4",
+                    "location": "pipeline/theme_discovery.py:_build_guided_codeframe:other_counts",
+                    "message": "Other vs Non-answer counts",
+                    "data": {
+                        "target_type": target_type,
+                        "other_count": other_count,
+                        "other_examples": other_examples[:3],
+                        "non_answer_count": non_answer_count,
+                        "non_answer_examples": non_answer_examples[:3],
+                        "intl_samples": intl_samples[:3],
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
     ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
     max_subthemes = None
     if max_subthemes and len(ordered) > max_subthemes:
@@ -1013,6 +1121,32 @@ def _build_guided_codeframe(
             "approx_pct": float(cnt) / float(total),
             "examples": examples.get(label, [])[:3],
         })
+
+    # #region agent log
+    try:
+        otherish = [
+            {"label": lbl, "count": cnt, "examples": examples.get(lbl, [])[:3]}
+            for lbl, cnt in ordered
+            if any(k in (lbl or "").lower() for k in ("other", "unclear", "invalid"))
+        ]
+        if otherish:
+            with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "sessionId": "debug-session",
+                    "runId": "pre-fix",
+                    "hypothesisId": "H2",
+                    "location": "pipeline/theme_discovery.py:_build_guided_codeframe:ordered_other",
+                    "message": "Other/unclear labels in ordered list",
+                    "data": {
+                        "target_type": target_type,
+                        "labels": otherish[:6],
+                        "ordered_count": len(ordered),
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }) + "\n")
+    except Exception:
+        pass
+    # #endregion
 
     theme_dict = {
         "major_themes": [

@@ -4,9 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="ef3ca652-dc23-4109-ad23-4687046f704e" name="Changes" comment="Fresh Push Pre-SITS Development">
+    <list default="true" id="ef3ca652-dc23-4109-ad23-4687046f704e" name="Changes" comment="Updated Push - Pre-Multi-Column Update">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/app_v1.py" beforeDir="false" afterPath="$PROJECT_DIR$/app_v1.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pipeline/assignment.py" beforeDir="false" afterPath="$PROJECT_DIR$/pipeline/assignment.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/pipeline/llm_client.py" beforeDir="false" afterPath="$PROJECT_DIR$/pipeline/llm_client.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/pipeline/theme_discovery.py" beforeDir="false" afterPath="$PROJECT_DIR$/pipeline/theme_discovery.py" afterDir="false" />
     </list>
@@ -95,13 +95,22 @@
       <option name="project" value="LOCAL" />
       <updated>1768249881312</updated>
     </task>
-    <option name="localTasksCounter" value="5" />
+    <task id="LOCAL-00005" summary="Updated Push - Pre-Multi-Column Update">
+      <option name="closed" value="true" />
+      <created>1770077698218</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1770077698218</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="First commit" />
     <MESSAGE value="Pre-trying new sub theme approach" />
     <MESSAGE value="Fresh Push Pre-SITS Development" />
-    <option name="LAST_COMMIT_MESSAGE" value="Fresh Push Pre-SITS Development" />
+    <MESSAGE value="Updated Push - Pre-Multi-Column Update" />
+    <option name="LAST_COMMIT_MESSAGE" value="Updated Push - Pre-Multi-Column Update" />
   </component>
 </project>
