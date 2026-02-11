@@ -6,7 +6,7 @@ assign single or multi‑codes with confidence, verify low‑confidence rows, an
 Notes
 - OpenAI API key is read from st.secrets["OPENAI_API_KEY"] or env var OPENAI_API_KEY.
 - Uses Chat Completions with temperature 0 and optional seed for determinism.
-- Always translates to English for coding, original text is preserved.
+- Optional translation to English for coding, original text is preserved.
 - Non‑answer handled as Major Theme = "Non‑answer" with Sub‑themes: Refusal, Don't know, Nonsense, Spam, Not applicable. "Other" sub-themes capture substantive outliers.
 - Multi‑coding default with up to 3 codes. Single‑coding is a toggle.
 - Dedupe strategy: theme discovery runs on unique texts with frequency weights.
@@ -20,6 +20,7 @@ import os
 import io
 import json
 import math
+import sys
 import datetime as dt
 import re
 import time
@@ -30,6 +31,7 @@ from threading import Lock
 import threading
 import random
 from collections import deque
+import hashlib
 
 
 
@@ -77,6 +79,12 @@ from pipeline.theme_discovery import (
 from pipeline.governance import (
     GOVERNANCE_SYSTEM as PIPE_GOVERNANCE_SYSTEM,
     GOVERNANCE_USER_TEMPLATE as PIPE_GOVERNANCE_USER_TEMPLATE,
+)
+from pipeline.translation import (
+    build_combined_texts,
+    build_export_base_columns,
+    is_english_language,
+    normalize_language_value,
 )
 from pipeline.utils import chunk_data, estimate_tokens, safe_prompt_token_budget
 from theme_governance import (
@@ -153,6 +161,23 @@ def fmt_cost(total_prompt_tokens: int, total_completion_tokens: int, pricing: Di
 
 def today_stamp() -> str:
     return dt.datetime.now().strftime("%Y%m%d")
+
+
+def debug_log_event(hypothesis_id: str, location: str, message: str, data: Dict[str, Any], run_id: str = "translation-pre-fix") -> None:
+    try:
+        payload = {
+            "id": f"log_{int(time.time() * 1000)}_{random.randint(1000, 9999)}",
+            "timestamp": int(time.time() * 1000),
+            "location": location,
+            "message": message,
+            "data": data,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+        }
+        with open(r"c:\Users\apier\PycharmProjects\OpenEndCoding\.cursor\debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def clean_text(x: Any) -> str:
@@ -636,6 +661,135 @@ QUESTION_LABEL_SCHEMA = {
 }
 
 
+TRANSLATION_SYSTEM = (
+    "You are a professional survey translator. Translate respondent text to English while preserving "
+    "meaning, tone, and specificity. Do not summarize, do not classify, and do not add interpretation."
+)
+
+TRANSLATION_USER_TEMPLATE = (
+    """
+Translate this open-ended response to English using the provided language value.
+
+Rules:
+- Rely on the provided language value as the source-language hint.
+- If the response is already in English, return it unchanged.
+- If language is unknown, still produce the best possible English translation.
+- Preserve proper nouns and brand names unless they are commonly translated.
+- Return only JSON matching the schema and always include:
+  - translated_text (string)
+  - notes (string, use "" when no note is needed)
+
+Language value:
+{language_value}
+
+Normalized language hint:
+{language_hint}
+
+Response:
+{response_text}
+"""
+)
+
+TRANSLATION_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "translation_result",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "translated_text": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            "required": ["translated_text", "notes"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+}
+
+# --- Batch translation for large-scale runs ---
+
+TRANSLATION_BATCH_MAX_ITEMS = 20
+TRANSLATION_BATCH_MAX_WORKERS = 8
+
+TRANSLATION_BATCH_SYSTEM = (
+    "You are a professional survey translator. Translate each respondent text to English while preserving "
+    "meaning, tone, and specificity. Do not summarize, classify, or add interpretation."
+)
+
+TRANSLATION_BATCH_USER_TEMPLATE = (
+    """Translate each item below to English. Use the language hint for each item.
+
+Rules:
+- If already in English, return unchanged.
+- If language is unknown, still produce the best possible English translation.
+- Preserve proper nouns and brand names.
+- Return one result per input item, preserving the idx field.
+
+Items (JSON array):
+{items_json}
+"""
+)
+
+TRANSLATION_BATCH_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "translation_batch_result",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "idx": {"type": "integer"},
+                            "translated_text": {"type": "string"},
+                        },
+                        "required": ["idx", "translated_text"],
+                        "additionalProperties": True,
+                    },
+                }
+            },
+            "required": ["items"],
+            "additionalProperties": True,
+        },
+        "strict": False,
+    },
+}
+
+
+def translate_batch(
+    client: OpenAI,
+    model: str,
+    items: List[Dict[str, Any]],
+    seed: int | None,
+) -> Dict[int, str]:
+    """Translate a batch of items in a single API call. Returns {idx: translated_text}."""
+    items_json = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+    user = TRANSLATION_BATCH_USER_TEMPLATE.format(items_json=items_json)
+    data, usage = retry_with_backoff(
+        lambda: oai_json_completion(
+            client,
+            model,
+            TRANSLATION_BATCH_SYSTEM,
+            user,
+            seed,
+            response_schema=TRANSLATION_BATCH_SCHEMA,
+            reasoning_effort="minimal",
+            verbosity="low",
+            reserve_output_tokens=max(1_200, len(items) * 120),
+        )
+    )
+    results: Dict[int, str] = {}
+    for item in (data.get("items", []) if isinstance(data, dict) else []):
+        idx = item.get("idx")
+        text = clean_text(item.get("translated_text", ""))
+        if isinstance(idx, int) and text:
+            results[idx] = text
+    return results, usage
+
+
 def infer_question_label(client: OpenAI, model: str, question_text: str, seed: int | None) -> str:
     """Infer a compact question label like qAge or qGender from the question text."""
     if not question_text:
@@ -674,6 +828,36 @@ def infer_question_label(client: OpenAI, model: str, question_text: str, seed: i
     if not label.lower().startswith("q"):
         label = f"q{label}"
     return label or "qQuestion"
+
+
+def translate_response_to_english(
+    client: OpenAI,
+    model: str,
+    response_text: str,
+    language_value_raw: str,
+    language_hint: str,
+    seed: int | None,
+) -> Tuple[str, Dict[str, int]]:
+    user = TRANSLATION_USER_TEMPLATE.format(
+        language_value=language_value_raw or "Unknown",
+        language_hint=language_hint or "Unknown",
+        response_text=response_text,
+    )
+    data, usage = retry_with_backoff(
+        lambda: oai_json_completion(
+            client,
+            model,
+            TRANSLATION_SYSTEM,
+            user,
+            seed,
+            response_schema=TRANSLATION_SCHEMA,
+            reasoning_effort="minimal",
+            verbosity="low",
+            reserve_output_tokens=1_200,
+        )
+    )
+    translated = clean_text(data.get("translated_text", "") if isinstance(data, dict) else "")
+    return (translated or response_text), usage
 
 # ------------------------------
 # OpenAI helpers
@@ -2724,11 +2908,15 @@ df.columns = [str(c).strip() for c in df.columns]
 
 # Ask for question column(s)
 st.write("**Select open‑end column(s)**")
-group_mode = st.radio(
-    "Column grouping",
-    ["Single column", "Auto-group multi-select", "Manual multi-select"],
-    horizontal=True,
-)
+group_col, translation_toggle_col = st.columns([3.2, 1.1])
+with group_col:
+    group_mode = st.radio(
+        "Column grouping",
+        ["Single column", "Auto-group multi-select", "Manual multi-select"],
+        horizontal=True,
+    )
+with translation_toggle_col:
+    translation_enabled = st.toggle("Translation", value=False)
 
 def _infer_group_key(col_name: str) -> str:
     cleaned = str(col_name or "").strip()
@@ -2773,6 +2961,10 @@ else:
 if not text_cols:
     st.stop()
 
+language_col = ""
+if translation_enabled:
+    language_col = st.selectbox("Language column", options=df.columns.tolist())
+
 # Build safe, short suffixes for multi-column exports
 def _build_col_suffix_map(cols: List[str]) -> Dict[str, str]:
     seen: Dict[str, int] = {}
@@ -2797,9 +2989,29 @@ def _build_col_suffix_map(cols: List[str]) -> Dict[str, str]:
 col_suffix_map = _build_col_suffix_map(text_cols)
 
 # Reset downstream results if the uploaded file or selected columns changed
-_input_sig = (uploaded.name, getattr(uploaded, "size", None), tuple(text_cols))
+_input_sig = (
+    uploaded.name,
+    getattr(uploaded, "size", None),
+    tuple(text_cols),
+    bool(translation_enabled),
+    language_col if translation_enabled else "",
+)
 if st.session_state.get("_input_sig") != _input_sig:
-    for k in ("assigned_raw", "theme_validation", "_usage_totals", "_auto_verified", "theme_governance_log", "_cache_stats", "assignment_index_map", "destination_normalization_map"):
+    for k in (
+        "assigned_raw",
+        "theme_validation",
+        "_usage_totals",
+        "_auto_verified",
+        "theme_governance_log",
+        "_cache_stats",
+        "assignment_index_map",
+        "destination_normalization_map",
+        "translation_status_map",
+        "translated_column_values",
+        "translated_pretheme_df",
+        "translation_completed_sig",
+        "translation_usage",
+    ):
         st.session_state.pop(k, None)
     st.session_state["_input_sig"] = _input_sig
 
@@ -2814,25 +3026,319 @@ pass_id_cols = st.multiselect("ID columns to carry through", options=df.columns.
 # Prepare series (combined across selected columns)
 column_ser = {col: df[col].map(clean_text) for col in text_cols}
 column_ser_ai = {col: (column_ser[col].map(redact_pii) if redact_pii_enabled else column_ser[col]) for col in text_cols}
+# Initialize OpenAI client
+client = get_openai_client()
 
-combined_texts: List[str] = []
-combined_index_map: List[Dict[str, Any]] = []
-for row_idx in range(len(df)):
-    for col in text_cols:
-        combined_texts.append(str(column_ser_ai[col].iloc[row_idx]) if pd.notna(column_ser_ai[col].iloc[row_idx]) else "")
-        combined_index_map.append({"row_index": row_idx, "column": col})
+translation_ready = False
+translated_column_ser: Dict[str, pd.Series] = {}
+translation_required = bool(translation_enabled)
 
-ser = pd.Series(combined_texts)
-ser_ai = ser
+if translation_enabled:
+    st.write("**Translation setup**")
+    language_values = df[language_col].map(clean_text) if language_col in df.columns else pd.Series([""] * len(df))
+    total_cells = len(df) * len(text_cols)
+    # region agent log
+    debug_log_event(
+        "H1",
+        "app_v1.py:translation_setup",
+        "Translation setup initialized",
+        {
+            "translation_enabled": bool(translation_enabled),
+            "language_col": language_col,
+            "row_count": int(len(df)),
+            "text_col_count": int(len(text_cols)),
+            "total_cells": int(total_cells),
+            "input_sig_hash": hashlib.sha256(str(_input_sig).encode("utf-8")).hexdigest()[:12],
+        },
+    )
+    # endregion
+    status_map = st.session_state.get("translation_status_map", {})
+    translated_count = sum(1 for s in status_map.values() if s == "translated")
+    skipped_count = sum(1 for s in status_map.values() if s == "skipped-english")
+    error_count = sum(1 for s in status_map.values() if s == "error")
+    if status_map:
+        st.caption(
+            f"Last translation run: translated={translated_count}, skipped_english={skipped_count}, errors={error_count}, total_cells={total_cells}"
+        )
+
+    if st.button("Run Translation", type="secondary"):
+        translate_progress = st.progress(0)
+        translate_status = st.empty()
+        translated_values: Dict[str, List[str]] = {
+            col: [str(x) if pd.notna(x) else "" for x in column_ser_ai[col].tolist()]
+            for col in text_cols
+        }
+        translation_status_map: Dict[str, str] = {}
+        usage_translation = {"prompt_tokens": 0, "completion_tokens": 0, "embedding_tokens": 0}
+        processed = 0
+        errors = 0
+        api_call_attempts = 0
+        english_skips = 0
+        empty_skips = 0
+        error_type_counts: Dict[str, int] = {}
+        error_examples: List[Dict[str, Any]] = []
+        # region agent log
+        debug_log_event(
+            "H6",
+            "app_v1.py:translation_run_start",
+            "Translation run started",
+            {
+                "model": model,
+                "seed": seed,
+                "text_col_count": int(len(text_cols)),
+                "language_col": language_col,
+            },
+        )
+        # endregion
+
+        # --- Phase 1: Deduplicate texts that need translation ---
+        translate_status.text("Deduplicating texts for translation...")
+        # Map: (text, lang_key) -> list of (row_idx, col) locations
+        dedup_map: Dict[Tuple[str, str], List[Tuple[int, str]]] = {}
+        for row_idx in range(len(df)):
+            canonical_lang, raw_lang = normalize_language_value(
+                language_values.iloc[row_idx] if row_idx < len(language_values) else ""
+            )
+            for col in text_cols:
+                source_text = translated_values[col][row_idx]
+                status_key = f"{row_idx}::{col}"
+                if not source_text:
+                    translation_status_map[status_key] = "empty"
+                    empty_skips += 1
+                    processed += 1
+                elif is_english_language(raw_lang) or is_english_language(canonical_lang):
+                    translation_status_map[status_key] = "skipped-english"
+                    english_skips += 1
+                    processed += 1
+                else:
+                    lang_key = f"{canonical_lang}||{raw_lang}"
+                    dedup_key = (source_text, lang_key)
+                    dedup_map.setdefault(dedup_key, []).append((row_idx, col))
+
+        unique_to_translate = len(dedup_map)
+        translate_status.text(
+            f"Found {unique_to_translate:,} unique texts to translate "
+            f"(deduplicated from {sum(len(v) for v in dedup_map.values()):,} cells). "
+            f"Skipped {english_skips:,} English, {empty_skips:,} empty."
+        )
+        translate_progress.progress(5)
+
+        # --- Phase 2: Build batches of unique texts ---
+        batch_items: List[List[Dict[str, Any]]] = []
+        current_batch: List[Dict[str, Any]] = []
+        dedup_keys_ordered = list(dedup_map.keys())
+        for batch_idx, (text, lang_key) in enumerate(dedup_keys_ordered):
+            canonical_lang_val, raw_lang_val = lang_key.split("||", 1)
+            current_batch.append({
+                "idx": batch_idx,
+                "text": text[:500],  # Truncate very long texts
+                "language": canonical_lang_val or raw_lang_val or "Unknown",
+            })
+            if len(current_batch) >= TRANSLATION_BATCH_MAX_ITEMS:
+                batch_items.append(current_batch)
+                current_batch = []
+        if current_batch:
+            batch_items.append(current_batch)
+
+        # --- Phase 3: Translate batches in parallel ---
+        translated_unique: Dict[int, str] = {}  # batch_idx -> translated_text
+        batch_errors = 0
+        usage_lock = Lock()
+
+        def _translate_one_batch(batch: List[Dict[str, Any]]) -> Dict[int, str]:
+            return translate_batch(client, model, batch, seed)
+
+        completed_batches = 0
+        total_batches = len(batch_items)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=TRANSLATION_BATCH_MAX_WORKERS) as executor:
+            future_to_batch = {executor.submit(_translate_one_batch, b): b for b in batch_items}
+            for future in concurrent.futures.as_completed(future_to_batch):
+                batch = future_to_batch[future]
+                try:
+                    results, usage = future.result(timeout=120)
+                    translated_unique.update(results)
+                    with usage_lock:
+                        usage_translation["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+                        usage_translation["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+                    api_call_attempts += 1
+                except Exception as e:
+                    # Fallback: try items individually
+                    for item in batch:
+                        try:
+                            lang_parts = item.get("language", "Unknown")
+                            single_text, single_usage = translate_response_to_english(
+                                client=client,
+                                model=model,
+                                response_text=item["text"],
+                                language_value_raw=lang_parts,
+                                language_hint=lang_parts,
+                                seed=seed,
+                            )
+                            translated_unique[item["idx"]] = single_text
+                            with usage_lock:
+                                usage_translation["prompt_tokens"] += int(single_usage.get("prompt_tokens", 0) or 0)
+                                usage_translation["completion_tokens"] += int(single_usage.get("completion_tokens", 0) or 0)
+                            api_call_attempts += 1
+                        except Exception as e2:
+                            batch_errors += 1
+                            err = str(e2)[:240]
+                            err_type = type(e2).__name__
+                            error_type_counts[err_type] = int(error_type_counts.get(err_type, 0)) + 1
+                            if len(error_examples) < 5:
+                                error_examples.append({
+                                    "batch_idx": item["idx"],
+                                    "error_type": err_type,
+                                    "error_message": err,
+                                })
+
+                completed_batches += 1
+                pct = 5 + int((completed_batches / max(1, total_batches)) * 90)
+                translate_progress.progress(min(99, pct))
+                translate_status.text(
+                    f"Translating... batch {completed_batches}/{total_batches} "
+                    f"({len(translated_unique):,}/{unique_to_translate:,} unique texts done)"
+                )
+
+        # --- Phase 4: Map translated texts back to all original locations ---
+        translate_status.text("Mapping translations back to all rows...")
+        for batch_idx, (dedup_key, locations) in enumerate(zip(dedup_keys_ordered, dedup_map.values())):
+            translated_text = translated_unique.get(batch_idx)
+            for row_idx, col in locations:
+                status_key = f"{row_idx}::{col}"
+                if translated_text:
+                    translated_values[col][row_idx] = translated_text
+                    translation_status_map[status_key] = "translated"
+                else:
+                    translation_status_map[status_key] = "error"
+                    errors += 1
+                processed += 1
+
+        errors += batch_errors
+
+        pretheme_cols: List[str] = []
+        for c in pass_id_cols + ([language_col] if language_col else []) + text_cols:
+            if c and c not in pretheme_cols:
+                pretheme_cols.append(c)
+        translated_pretheme_df = df[pretheme_cols].copy() if pretheme_cols else pd.DataFrame(index=df.index)
+        for col in text_cols:
+            translated_pretheme_df[f"{col}_TRANSLATED"] = translated_values[col]
+
+        st.session_state["translated_column_values"] = translated_values
+        st.session_state["translation_status_map"] = translation_status_map
+        st.session_state["translated_pretheme_df"] = translated_pretheme_df
+        st.session_state["translation_completed_sig"] = _input_sig
+        st.session_state["translation_usage"] = usage_translation
+        changed_cells = 0
+        for col in text_cols:
+            source_values = [str(x) if pd.notna(x) else "" for x in column_ser_ai[col].tolist()]
+            for idx, translated_value in enumerate(translated_values[col]):
+                if str(translated_value) != str(source_values[idx]):
+                    changed_cells += 1
+        # region agent log
+        debug_log_event(
+            "H2",
+            "app_v1.py:translation_run_complete",
+            "Translation run finished",
+            {
+                "processed_cells": int(processed),
+                "api_call_attempts": int(api_call_attempts),
+                "translated_count": int(sum(1 for s in translation_status_map.values() if s == "translated")),
+                "error_count": int(errors),
+                "english_skips": int(english_skips),
+                "empty_skips": int(empty_skips),
+                "changed_cells": int(changed_cells),
+                "prompt_tokens": int(usage_translation.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage_translation.get("completion_tokens", 0) or 0),
+                "error_type_counts": error_type_counts,
+                "error_examples": error_examples,
+            },
+        )
+        # endregion
+        if errors > 0:
+            st.warning(f"Translation completed with {errors} cell-level errors. Original text was kept for failed cells.")
+        st.rerun()
+
+    if st.session_state.get("translation_completed_sig") == _input_sig:
+        stored_translated = st.session_state.get("translated_column_values", {})
+        if isinstance(stored_translated, dict) and all(col in stored_translated for col in text_cols):
+            translated_column_ser = {
+                col: pd.Series(stored_translated.get(col, [""] * len(df))).map(clean_text).reindex(range(len(df)), fill_value="")
+                for col in text_cols
+            }
+            translation_ready = True
+            st.success("Translation ready. Theme processing will use translated English text.")
+            translated_pretheme_df = st.session_state.get("translated_pretheme_df")
+            changed_cells_loaded = 0
+            for col in text_cols:
+                source_values = [str(x) if pd.notna(x) else "" for x in column_ser_ai[col].tolist()]
+                translated_loaded = translated_column_ser.get(col, pd.Series([""] * len(df))).tolist()
+                for idx, translated_value in enumerate(translated_loaded):
+                    if str(translated_value) != str(source_values[idx]):
+                        changed_cells_loaded += 1
+            # region agent log
+            debug_log_event(
+                "H3",
+                "app_v1.py:translation_state_loaded",
+                "Loaded translated state for processing",
+                {
+                    "translation_ready": bool(translation_ready),
+                    "changed_cells_loaded": int(changed_cells_loaded),
+                    "stored_keys_count": int(len(stored_translated.keys())),
+                    "completed_sig_matches_input": bool(st.session_state.get("translation_completed_sig") == _input_sig),
+                },
+            )
+            # endregion
+            if isinstance(translated_pretheme_df, pd.DataFrame) and not translated_pretheme_df.empty:
+                # region agent log
+                debug_log_event(
+                    "H4",
+                    "app_v1.py:pretheme_download_ready",
+                    "Prepared translated pre-theme dataframe for download",
+                    {
+                        "pretheme_rows": int(len(translated_pretheme_df)),
+                        "pretheme_cols": int(len(translated_pretheme_df.columns)),
+                        "translated_col_count": int(len([c for c in translated_pretheme_df.columns if str(c).endswith("_TRANSLATED")])),
+                    },
+                )
+                # endregion
+                translated_buf = io.BytesIO()
+                with pd.ExcelWriter(translated_buf, engine="xlsxwriter") as writer:
+                    translated_pretheme_df.to_excel(writer, sheet_name="Translated Pre-Theme", index=False)
+                st.download_button(
+                    "Download translated pre-theme XLSX",
+                    data=translated_buf.getvalue(),
+                    file_name=f"translated_pre_theme_{today_stamp()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+    else:
+        # region agent log
+        debug_log_event(
+            "H5",
+            "app_v1.py:translation_not_ready",
+            "Translation not ready for current input signature",
+            {
+                "translation_required": bool(translation_required),
+                "completed_sig_exists": bool(st.session_state.get("translation_completed_sig")),
+                "completed_sig_matches_input": bool(st.session_state.get("translation_completed_sig") == _input_sig),
+            },
+        )
+        # endregion
+        st.info("Run Translation to generate English text before processing themes.")
+
+column_ser_for_coding = translated_column_ser if translation_ready else column_ser_ai
+column_value_lists = {
+    col: [str(x) if pd.notna(x) else "" for x in column_ser_for_coding[col].tolist()]
+    for col in text_cols
+}
+combined_texts, combined_index_map = build_combined_texts(column_value_lists, text_cols, len(df))
+ser_ai = pd.Series(combined_texts)
 st.session_state["assignment_index_map"] = combined_index_map
 
 # Build unique set with frequency weights (AI-safe text) but preserve order for output mapping
 value_counts = ser_ai.value_counts(dropna=False)
 unique_texts = value_counts.index.tolist()
 unique_freqs = value_counts.values.tolist()
-
-# Initialize OpenAI client
-client = get_openai_client()
 
 # Use the selected columns as question context
 question_text = group_label or " / ".join(text_cols)
@@ -2860,6 +3366,7 @@ prompt_versions = {
     "governance": compute_prompt_version(PIPE_GOVERNANCE_SYSTEM, PIPE_GOVERNANCE_USER_TEMPLATE),
     "assignment_stage2": compute_prompt_version(PIPE_ASSIGNMENT_STAGE2_SYSTEM, PIPE_ASSIGNMENT_STAGE2_USER_TEMPLATE),
     "destination_normalization": compute_prompt_version(PIPE_DESTINATION_NORMALIZE_SYSTEM, dest_norm_user),
+    "translation": compute_prompt_version(TRANSLATION_SYSTEM, TRANSLATION_USER_TEMPLATE),
 }
 run_settings = {
     "model": model,
@@ -2871,6 +3378,9 @@ run_settings = {
     "embedding_model": embedding_model,
     "question_columns": text_cols,
     "destination_normalization_model": "gpt-4o",
+    "translation_enabled": bool(translation_enabled),
+    "translation_completed": bool(translation_ready),
+    "language_column": language_col if translation_enabled else "",
 }
 run_id = compute_run_id(dataset_sig, model, seed, prompt_versions, run_settings)
 st.session_state["run_id"] = run_id
@@ -2937,9 +3447,12 @@ if theme_source == "Upload existing themes":
         if "theme_dict" in st.session_state:
             st.write("**Current theme dictionary:**")
             theme_df = flatten_theme_dict(st.session_state["theme_dict"])
-            st.dataframe(theme_df, width="stretch")
+            st.dataframe(theme_df, use_container_width=True)
 
-            if st.button("Apply uploaded themes", type="primary"):
+            apply_uploaded_disabled = translation_required and not translation_ready
+            if apply_uploaded_disabled:
+                st.warning("Translation is enabled. Run Translation before applying uploaded themes.")
+            if st.button("Apply uploaded themes", type="primary", disabled=apply_uploaded_disabled):
                 # Assign themes with progress
                 apply_progress = st.progress(0)
                 apply_status = st.empty()
@@ -2985,13 +3498,14 @@ if theme_source == "Add coding context":
 
     st.write("**Target type (optional):**")
     target_options = {
-        "Destination": "destination",
         "Auto (from guidance)": "auto",
-        "Location (General)": "location",
-        "City": "city",
-        "County": "county",
+        "Destination": "destination",
+        "U.S. Destinations (by state)": "us_destinations_by_state",
         "Country": "country",
         "US state": "state",
+        "County": "county",
+        "City": "city",
+        "Location (General)": "location",
         "Brand": "brand",
         "Adjective/descriptor": "adjective",
         "One-word response": "one_word",
@@ -3066,8 +3580,10 @@ if show_generate:
     estimated_completion_tokens = 2000  # Rough estimate for theme generation
     
     # Keep estimation internal; no extra UI noise
-
-    if st.button("Process Themes", type="primary"):
+    process_themes_disabled = translation_required and not translation_ready
+    if process_themes_disabled:
+        st.warning("Translation is enabled. Run Translation before processing themes.")
+    if st.button("Process Themes", type="primary", disabled=process_themes_disabled):
         st.session_state["theme_source"] = theme_source
         # Start the overall timer
         overall_start_time = time.time()
@@ -3277,7 +3793,7 @@ if "theme_validation" in st.session_state:
 # Show theme dictionary
 st.write("**Generated Theme Dictionary:**")
 theme_df = flatten_theme_dict(st.session_state["theme_dict"])
-st.dataframe(theme_df, width="stretch")
+st.dataframe(theme_df, use_container_width=True)
 
 # Theme export functionality
 st.write("**Export Theme Dictionary:**")
@@ -3437,6 +3953,7 @@ for idx, meta in enumerate(index_map):
         assigned_by_col[col_name][row_index] = assign_map.get(idx, {"assignments": [], "rationale": ""})
 
 coded_rows = []
+include_translated_in_export = bool(translation_enabled and translation_ready)
 for i in range(len(df)):
     row = {"RowIndex": i}
 
@@ -3454,6 +3971,8 @@ for i in range(len(df)):
 
         prefix = _column_prefix(col)
         row[f"{prefix}_OE"] = column_ser.get(col, pd.Series([""])).iloc[i]
+        if include_translated_in_export:
+            row[f"{prefix}_TRANSLATED"] = column_ser_for_coding.get(col, pd.Series([""])).iloc[i]
         row[f"{prefix}_MajorTheme1"] = major_labels_aligned[0] if len(major_labels_aligned) > 0 else ""
         row[f"{prefix}_MinorTheme1"] = code_labels[0] if len(code_labels) > 0 else ""
         row[f"{prefix}_Theme1_Confidence"] = confs[0] if len(confs) > 0 else np.nan
@@ -3498,26 +4017,13 @@ except Exception:
 
 # Order columns
 id_before = pass_id_cols.copy()
-base_cols: List[str] = ["RowIndex"]
-for col in text_cols:
-    prefix = _column_prefix(col)
-    base_cols.extend([
-        f"{prefix}_OE",
-        f"{prefix}_MajorTheme1",
-        f"{prefix}_MinorTheme1",
-        f"{prefix}_Theme1_Confidence",
-    ])
-    if allow_multicode:
-        base_cols.extend([
-            f"{prefix}_MajorTheme2",
-            f"{prefix}_MajorTheme3",
-            f"{prefix}_MinorTheme2",
-            f"{prefix}_MinorTheme3",
-            f"{prefix}_Theme2_Confidence",
-            f"{prefix}_Theme3_Confidence",
-        ])
-    is_multi_col = "IsMultiCoded" if len(text_cols) == 1 else f"{prefix}_IsMultiCoded"
-    base_cols.append(is_multi_col)
+prefixes = [_column_prefix(col) for col in text_cols]
+base_cols = build_export_base_columns(
+    prefixes=prefixes,
+    allow_multicode=bool(allow_multicode),
+    include_translated=include_translated_in_export,
+    single_column_mode=(len(text_cols) == 1),
+)
 
 ordered_cols = id_before + base_cols
 coded_df = coded_df[ordered_cols]
@@ -3528,7 +4034,7 @@ st.subheader("Review & Verification")
 
 # Show coded data preview
 st.write("**Coded Data Preview:**")
-st.dataframe(coded_df.head(20), width="stretch")
+st.dataframe(coded_df.head(20), use_container_width=True)
 
 # Identify responses needing review
 low = float(low_thresh)
@@ -3569,7 +4075,7 @@ if flagged:
 
     needs_review_df = pd.DataFrame(review_rows)
     st.write("**Needs review**")
-    st.dataframe(needs_review_df, width="stretch")
+    st.dataframe(needs_review_df, use_container_width=True)
 
     csv_buf = needs_review_df.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -3872,7 +4378,7 @@ if not chart_data.empty:
     
     # Show the data table for reference
     st.write("**Theme Distribution Data:**")
-    st.dataframe(chart_data, width="stretch")
+    st.dataframe(chart_data, use_container_width=True)
 else:
     st.info("No themes selected for display.")
 
@@ -3978,6 +4484,13 @@ if "usage_theme" in locals():
     total_usage["prompt_tokens"] += usage_theme.get("prompt_tokens", 0)
     total_usage["completion_tokens"] += usage_theme.get("completion_tokens", 0)
     total_usage["embedding_tokens"] += usage_theme.get("embedding_tokens", 0)
+
+# Add usage from translation if available
+if "translation_usage" in st.session_state:
+    usage_translation = st.session_state.get("translation_usage", {})
+    total_usage["prompt_tokens"] += int(usage_translation.get("prompt_tokens", 0) or 0)
+    total_usage["completion_tokens"] += int(usage_translation.get("completion_tokens", 0) or 0)
+    total_usage["embedding_tokens"] += int(usage_translation.get("embedding_tokens", 0) or 0)
 
 # Add usage from assignment if available
 if "usage_assign" in locals():

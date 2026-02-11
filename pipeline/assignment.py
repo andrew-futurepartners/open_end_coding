@@ -286,9 +286,16 @@ def assign_codes_two_stage(
 
         if normalization_map:
             augmented = 0
+            non_response_id = default_nonanswer_id
             for i, text in enumerate(substantive_texts):
                 mapped_label = normalization_map.get(text)
                 if not mapped_label:
+                    continue
+                # Non-response from normalization: force non-answer assignment
+                if _norm_label(mapped_label) in ("non-response", "nonresponse", "non response"):
+                    if non_response_id:
+                        candidate_lists[i] = [non_response_id]
+                        augmented += 1
                     continue
                 mapped_id = label_to_id.get(_norm_label(mapped_label))
                 if mapped_id and mapped_id not in candidate_lists[i]:

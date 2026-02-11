@@ -5,10 +5,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="ef3ca652-dc23-4109-ad23-4687046f704e" name="Changes" comment="Updated Push - Pre-Multi-Column Update">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/app_v1.py" beforeDir="false" afterPath="$PROJECT_DIR$/app_v1.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pipeline/llm_client.py" beforeDir="false" afterPath="$PROJECT_DIR$/pipeline/llm_client.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pipeline/theme_discovery.py" beforeDir="false" afterPath="$PROJECT_DIR$/pipeline/theme_discovery.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />

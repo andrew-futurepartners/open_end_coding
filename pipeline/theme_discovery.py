@@ -22,6 +22,7 @@ from pipeline.llm_client import (
 from pipeline.geocode import (
     GeoCache,
     GeoRateLimiter,
+    US_STATE_ABBREV,
     get_default_geocode_cache,
     get_default_geocode_limiter,
     normalize_city,
@@ -289,17 +290,23 @@ def _normalize_brand_destination(text: str) -> str:
 
 DESTINATION_FUZZY_THRESHOLD = 0.95
 DESTINATION_NORMALIZE_MODEL = "gpt-4o"
-DESTINATION_BATCH_MAX_ITEMS = 10
-DESTINATION_BATCH_TOKEN_CAP = 12_000
-DESTINATION_BATCH_MAX_WORKERS = 6
-DESTINATION_BATCH_TIMEOUT_SEC = 90
+DESTINATION_BATCH_MAX_ITEMS = 25
+DESTINATION_BATCH_TOKEN_CAP = 20_000
+DESTINATION_BATCH_MAX_WORKERS = 8
+DESTINATION_BATCH_TIMEOUT_SEC = 180
 DESTINATION_NORMALIZE_TRUNCATE_CHARS = 200
 
 DESTINATION_NORMALIZE_SYSTEM = (
     "You canonicalize destination responses. Use the question and guidance to decide how to normalize. "
     "If unsure, return a cleaned, title-cased version of the input. "
-    "If the input is a non-response (e.g., n/a, none, prefer not to say), "
-    "set is_non_response=true and label must be empty. Return English-only labels."
+    "If the input is a non-response, set is_non_response=true and label must be empty. "
+    "Non-responses include: n/a, none, prefer not to say, don't know, single common words that are "
+    "clearly not places (e.g., 'and', 'go', 'not', 'the'), placeholders (e.g., 'xxx'), or gibberish. "
+    "IMPORTANT: Correct obvious typos/misspellings (e.g. 'Lots angeles' -> 'Los Angeles, CA'). "
+    "Regional descriptions (e.g. 'west coast', 'east coast', 'all along the west coast') are valid "
+    "destinations and should be normalized with (General). "
+    "Vague interest categories (e.g. 'restaurants', 'eateries', 'nightlife') should get a (General) "
+    "label, NOT be marked as non-response. Return English-only labels."
 )
 
 DESTINATION_NORMALIZE_USER_TEMPLATE = (
@@ -312,8 +319,13 @@ DESTINATION_NORMALIZE_USER_TEMPLATE = (
     "- If ambiguous (e.g., 'Disney'), set is_general=true and label should be 'Disney (General)'.\n"
     "- Do NOT return empty label unless is_non_response=true.\n"
     "- If unsure, return cleaned, title-cased input.\n"
-    "- Only mark non-response for explicit non-responses (n/a, none, prefer not, don't know).\n"
-    "- Return English-only labels; no emojis.\n\n"
+    "- Correct obvious typos and misspellings (e.g. 'Lots angeles' -> 'Los Angeles, CA').\n"
+    "- Regional phrases (e.g. 'west coast', 'all along the west coast') are valid: normalize with (General).\n"
+    "- Vague interest categories (e.g. 'restaurants', 'eateries', 'nightlife', 'red light district') "
+    "are valid: normalize with (General). Do NOT mark them as non-response.\n"
+    "- Mark non-response ONLY for: explicit refusals (n/a, none, prefer not, don't know), "
+    "single common words that are clearly not places (and, or, go, not, the), placeholders (xxx), gibberish.\n"
+    "- Return English-only labels; no emojis.\n"
     "- Return one output item per input item and preserve idx.\n\n"
     "Examples:\n"
     "Input: \"Disney\"\n"
@@ -322,7 +334,17 @@ DESTINATION_NORMALIZE_USER_TEMPLATE = (
     "Output: {{\"label\":\"Disneyland\",\"is_general\":false,\"is_non_response\":false}}\n"
     "Input: \"LA\"\n"
     "Output: {{\"label\":\"Los Angeles, CA\",\"is_general\":false,\"is_non_response\":false}}\n"
+    "Input: \"Lots angeles\"\n"
+    "Output: {{\"label\":\"Los Angeles, CA\",\"is_general\":false,\"is_non_response\":false}}\n"
+    "Input: \"all along the west coast\"\n"
+    "Output: {{\"label\":\"West Coast (General)\",\"is_general\":true,\"is_non_response\":false}}\n"
+    "Input: \"Restaurants\"\n"
+    "Output: {{\"label\":\"Restaurants (General)\",\"is_general\":true,\"is_non_response\":false}}\n"
     "Input: \"n/a\"\n"
+    "Output: {{\"label\":\"\",\"is_general\":false,\"is_non_response\":true}}\n"
+    "Input: \"Go\"\n"
+    "Output: {{\"label\":\"\",\"is_general\":false,\"is_non_response\":true}}\n"
+    "Input: \"And\"\n"
     "Output: {{\"label\":\"\",\"is_general\":false,\"is_non_response\":true}}\n\n"
     "Items (JSON array):\n"
     "{items_json}\n"
@@ -373,6 +395,27 @@ DESTINATION_ALIAS_MAP = {
 
 def _destination_key(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+def _extract_us_state_from_label(label: str) -> str:
+    """Extract US state name from a normalized destination label (e.g. 'Los Angeles, CA' -> 'California')."""
+    if not label:
+        return ""
+    label_str = str(label).strip()
+    # Reverse map: code -> full state name (e.g., CA -> California)
+    code_to_state = {v.upper(): k.title() for k, v in US_STATE_ABBREV.items()}
+    # Match trailing ", XX" (2-letter state code)
+    match = re.search(r",\s*([A-Za-z]{2})\s*$", label_str)
+    if match:
+        code = match.group(1).upper()
+        if code in code_to_state:
+            return code_to_state[code]
+    # Check for full state names in label
+    label_lower = label_str.lower()
+    for state_name, code in US_STATE_ABBREV.items():
+        if state_name in label_lower or state_name.replace(" ", "") in label_lower.replace(" ", ""):
+            return state_name.title()
+    return ""
 
 
 def _expand_destination_aliases(label: str) -> str:
@@ -492,6 +535,76 @@ _EXPLICIT_NON_RESPONSE = {
     "no answer",
     "nothing",
 }
+
+# Common English words that are almost never valid US destination names.
+# Used for catch-all non-destination detection; extensible via _NON_DESTINATION_WORDS_ADDITIONS.
+_NON_DESTINATION_WORDS = frozenset({
+    # Articles
+    "a", "an", "the",
+    # Conjunctions & connectors
+    "and", "or", "but", "nor", "so", "yet", "for", "as",
+    # Prepositions (common)
+    "to", "in", "on", "at", "by", "of", "with", "from", "into", "through",
+    "during", "before", "after", "above", "below", "between", "under",
+    # Common verbs / fragments
+    "go", "get", "got", "not", "yes", "no", "maybe", "other", "etc",
+    # Pronouns & determiners
+    "it", "its", "this", "that", "these", "those", "any", "some", "all",
+    # Placeholders & gibberish
+    "xxx", "xx", "x", "na", "n/a", "idk", "idc", "tbd", "typo",
+    # Response qualifiers (not destinations)
+    "same", "different", "similar", "like", "about", "just", "only",
+})
+# Allow extensions without modifying the frozen set at runtime.
+_NON_DESTINATION_WORDS_ADDITIONS: set = set()
+
+
+def _looks_like_invalid_destination(text: str) -> bool:
+    """
+    Heuristic catch-all: returns True if text is unlikely to be a valid US destination.
+    Designed to be dynamic and scalable (word set + pattern rules), not case-by-case.
+    """
+    if not text or not isinstance(text, str):
+        return True
+    raw = str(text).strip()
+    if not raw:
+        return True
+    normalized = " ".join(raw.lower().split())
+    if not normalized:
+        return True
+
+    # Gibberish: no letters
+    if not any(c.isalpha() for c in raw):
+        return True
+    # Repeated single char (xxx, ???, ---)
+    cleaned = re.sub(r"[\s]+", "", raw)
+    if len(cleaned) >= 2 and len(set(cleaned.lower())) == 1:
+        return True
+
+    tokens = [t.strip() for t in re.split(r"[\s,;]+", normalized) if t.strip()]
+    if not tokens:
+        return True
+
+    # Single token: check against non-destination words and length rules
+    if len(tokens) == 1:
+        tok = tokens[0].lower()
+        if tok in _NON_DESTINATION_WORDS or tok in _NON_DESTINATION_WORDS_ADDITIONS:
+            return True
+        if len(tok) <= 2:
+            # Allow known 2-letter state codes and destination aliases
+            key = re.sub(r"[^a-z0-9]+", "", tok)
+            if key in DESTINATION_ALIAS_MAP or key in {v.lower() for v in US_STATE_ABBREV.values()}:
+                return False
+            return True  # 1–2 chars that aren't known abbrevs
+        return False  # Longer single token: likely valid (city/place name)
+
+    # Multi-token: only flag if EVERY token is a non-destination word (e.g. "not so")
+    # This avoids false positives on regional descriptions like "all along the west coast"
+    all_words = _NON_DESTINATION_WORDS | _NON_DESTINATION_WORDS_ADDITIONS
+    if all(tok.lower() in all_words for tok in tokens):
+        return True
+
+    return False
 
 
 def _is_explicit_non_response(raw: str) -> bool:
@@ -650,7 +763,17 @@ def _canonicalize_destinations_ai(
             idx = item["idx"]
             raw_text = item["text"]
             normalized = results.get(idx, {}).get("label", "")
-            is_non_response = results.get(idx, {}).get("is_non_response", False)
+            ai_non_response = results.get(idx, {}).get("is_non_response", False)
+
+            # Trust the AI when it returns a valid label and does NOT flag non-response.
+            if normalized and not ai_non_response:
+                is_non_response = False
+            else:
+                is_non_response = (
+                    _is_explicit_non_response(raw_text)
+                    or _looks_like_invalid_destination(raw_text)
+                    or ai_non_response
+                )
             mapped = "Non-response" if is_non_response else normalized
             normalization_map[str(raw_text)] = mapped
             if len(samples) < 10:
@@ -685,7 +808,7 @@ def _build_guided_codeframe(
     non_answer_count = 0
     non_answer_examples: List[str] = []
     intl_samples: List[Dict[str, Any]] = []
-    if target_type in {"destination", "location", "city", "state", "country", "county", "brand", "adjective", "one_word", "general"}:
+    if target_type in {"destination", "us_destinations_by_state", "location", "city", "state", "country", "county", "brand", "adjective", "one_word", "general"}:
         prepared: List[Dict[str, Any]] = []
         resolved: List[Dict[str, Any]] = []
         debug_stats = {
@@ -705,10 +828,10 @@ def _build_guided_codeframe(
             debug_stats["total"] += 1
             candidate = raw
             label = ""
-            if target_type in {"location", "city", "state", "country", "county", "destination"}:
+            if target_type in {"location", "city", "state", "country", "county", "destination", "us_destinations_by_state"}:
                 candidate = _extract_location_candidate(raw)
                 geocode_label = ""
-                if target_type == "destination":
+                if target_type in {"destination", "us_destinations_by_state"}:
                     candidate = _expand_destination_aliases(candidate)
                 if normalize_locations and geocode_user_agent:
                     if target_type == "country":
@@ -757,7 +880,7 @@ def _build_guided_codeframe(
             else:
                 label = _normalize_value_label(raw)
 
-            if target_type == "destination" and label:
+            if target_type in {"destination", "us_destinations_by_state"} and label:
                 resolved.append({
                     "idx": idx,
                     "raw": raw,
@@ -765,7 +888,7 @@ def _build_guided_codeframe(
                     "label": label,
                 })
             else:
-                if target_type == "destination":
+                if target_type in {"destination", "us_destinations_by_state"}:
                     ai_text_source = "candidate"
                     ai_text = candidate
                     fallback_label = label or candidate
@@ -826,7 +949,20 @@ def _build_guided_codeframe(
             result = norm_results.get(item["idx"], {})
             label = _clean_normalized_label(result.get("label", "") or "")
             is_general = bool(result.get("is_general", False))
-            is_non_response = bool(result.get("is_non_response", False)) and _is_explicit_non_response(raw)
+            ai_says_non_response = bool(result.get("is_non_response", False))
+
+            # Trust the AI when it returns a valid label and does NOT flag non-response.
+            # This prevents the heuristic from overriding correct AI normalizations
+            # (e.g. typo "Lots angeles" → "Los Angeles, CA", or "all along the west coast" → region).
+            if label and not ai_says_non_response:
+                is_non_response = False
+            else:
+                # AI returned no label or flagged non-response — use heuristics as safety net
+                is_non_response = (
+                    _is_explicit_non_response(raw)
+                    or _looks_like_invalid_destination(raw)
+                    or ai_says_non_response
+                )
             geocode_label = _clean_normalized_label(item.get("geocode_label", "") or "")
 
             if _destination_key(label) == "disney":
@@ -870,7 +1006,7 @@ def _build_guided_codeframe(
                 label = geocode_label
             if is_general or "(general)" in label.lower():
                 label = _force_general_suffix(label)
-            elif target_type == "destination":
+            elif target_type in {"destination", "us_destinations_by_state"}:
                 label = _fuzzy_merge_destination(label, list(counts.keys()))
 
             # #region agent log
@@ -949,7 +1085,7 @@ def _build_guided_codeframe(
             if label not in examples:
                 examples[label] = []
             if len(examples[label]) < 3:
-                examples[label].append(label if target_type == "destination" else raw)
+                examples[label].append(label if target_type in {"destination", "us_destinations_by_state"} else raw)
 
         if len(counts) < 3:
             fallback_labels = {}
@@ -1079,6 +1215,57 @@ def _build_guided_codeframe(
         else:
             ordered = ordered[:max_subthemes]
     total = sum(cnt for _, cnt in ordered) or 1
+
+    if target_type == "us_destinations_by_state":
+        state_buckets: Dict[str, List[Tuple[str, int]]] = {}
+        for label, cnt in counts.items():
+            state_name = _extract_us_state_from_label(label)
+            bucket = state_name if state_name else "Other U.S. Destinations"
+            if bucket not in state_buckets:
+                state_buckets[bucket] = []
+            state_buckets[bucket].append((label, cnt))
+        for bucket in state_buckets:
+            state_buckets[bucket].sort(key=lambda kv: (-kv[1], kv[0].lower()))
+        state_names_sorted = sorted(
+            (s for s in state_buckets.keys() if s != "Other U.S. Destinations"),
+            key=lambda s: s.lower(),
+        )
+        if "Other U.S. Destinations" in state_buckets:
+            state_names_sorted.append("Other U.S. Destinations")
+        major_themes_list: List[Dict[str, Any]] = []
+        for maj_idx, state_name in enumerate(state_names_sorted, start=1):
+            pairs = state_buckets[state_name]
+            bucket_total = sum(c for _, c in pairs)
+            subs_list = []
+            for sub_idx, (sub_label, sub_cnt) in enumerate(pairs, start=1):
+                subs_list.append({
+                    "id": f"T{maj_idx}.{sub_idx}",
+                    "label": sub_label,
+                    "definition": f"Responses indicating {sub_label}.",
+                    "approx_pct": float(sub_cnt) / float(total),
+                    "examples": examples.get(sub_label, [])[:3],
+                })
+            major_themes_list.append({
+                "id": f"T{maj_idx}",
+                "label": f"{state_name} Destinations",
+                "definition": f"U.S. destinations in {state_name}.",
+                "approx_pct": float(bucket_total) / float(total),
+                "subs": subs_list,
+            })
+        major_themes_list.append({
+            "id": "T999",
+            "label": "Non-answer",
+            "definition": "Responses that do not provide a meaningful answer.",
+            "approx_pct": 0.0,
+            "subs": [
+                {"id": "T999.1", "label": "Refusal", "definition": "Refuses to answer.", "approx_pct": 0.0, "examples": []},
+                {"id": "T999.2", "label": "Don't know", "definition": "Does not know.", "approx_pct": 0.0, "examples": []},
+                {"id": "T999.3", "label": "Nonsense", "definition": "Unintelligible or nonsensical.", "approx_pct": 0.0, "examples": []},
+                {"id": "T999.4", "label": "Spam", "definition": "Spam or irrelevant text.", "approx_pct": 0.0, "examples": []},
+                {"id": "T999.5", "label": "Not applicable", "definition": "Not applicable.", "approx_pct": 0.0, "examples": []},
+            ],
+        })
+        return {"major_themes": major_themes_list}
 
     if target_type in {"city", "state", "country", "county", "location", "destination"}:
         if target_type == "country":

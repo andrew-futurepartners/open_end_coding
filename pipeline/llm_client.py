@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import hashlib
 import json
+import re
 import os
 import sqlite3
 import threading
@@ -181,6 +182,51 @@ class JsonParseError(ValueError):
         self.raw_text = raw_text
 
 
+def _parse_json_robust(raw: str) -> Dict[str, Any]:
+    """Try multiple strategies to parse JSON from LLM output (handles markdown, extra text)."""
+    text = (raw or "").strip()
+    if not text:
+        raise JsonParseError("Empty response.", raw_text=raw)
+
+    # 1. Direct parse
+    try:
+        out = json.loads(text)
+        if isinstance(out, dict):
+            return out
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Extract from ```json ... ``` or ``` ... ```
+    for pattern in (r"```(?:json)?\s*\n?(.*?)```", r"```\s*(.*?)```"):
+        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if match:
+            try:
+                out = json.loads(match.group(1).strip())
+                if isinstance(out, dict):
+                    return out
+            except json.JSONDecodeError:
+                pass
+
+    # 3. Find outermost {...}
+    start = text.find("{")
+    if start >= 0:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        out = json.loads(text[start : i + 1])
+                        if isinstance(out, dict):
+                            return out
+                    except json.JSONDecodeError:
+                        break
+
+    raise JsonParseError("Failed to parse JSON output.", raw_text=raw)
+
+
 def build_cache_key(
     model: str,
     system: str,
@@ -267,10 +313,7 @@ def oai_json_completion(
         raw = getattr(resp, "output_text", None)
         if not raw:
             raw = json.dumps(resp.model_dump(), ensure_ascii=False)
-        try:
-            parsed = json.loads(raw)
-        except Exception as e:
-            raise JsonParseError("Failed to parse JSON output.", raw_text=raw) from e
+        parsed = _parse_json_robust(raw)
         usage = getattr(resp, "usage", None)
         usage_dict = {
             "prompt_tokens": int(getattr(usage, "input_tokens", 0) or 0),
@@ -294,10 +337,7 @@ def oai_json_completion(
         request_params["max_completion_tokens"] = reserve_output_tokens
         response = client.chat.completions.create(**request_params)
         content = response.choices[0].message.content
-        try:
-            parsed = json.loads(content)
-        except Exception as e:
-            raise JsonParseError("Failed to parse JSON output.", raw_text=content) from e
+        parsed = _parse_json_robust(content)
         raw = content
         usage_dict = {
             "prompt_tokens": response.usage.prompt_tokens,
